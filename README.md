@@ -1,2 +1,2 @@
 # thermostat-pro-timeline-sync
-Synkroniserer skemaer fra Lovelace-kortet Thermostat pro timeline til fælles storage, så data og visning er ens på tværs af brugere og dashboards. Ændringer gemmes centralt, øger versionsnummeret og kan læses via en sensor, så UI opdateres uden polling.
+Syncs schedules from the Thermostat pro timeline Lovelace card to a shared store, keeping data and UI consistent across users and dashboards. Changes are saved centrally, bump a version, and are exposed via a sensor, so clients can refresh without polling.
