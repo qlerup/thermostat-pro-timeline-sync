@@ -1,1 +1,37 @@
+set_store:
+  name: Set full store
+  description: Replace the entire schedules store and bump version.
+  fields:
+    schedules:
+      name: Schedules
+      description: Object mapping entity_id -> {defaultTemp, blocks:[...]}.
+      required: true
+      example: >
+        {"climate.kitchen":{"defaultTemp":20,"blocks":[{"from":"06:00","to":"08:00","temp":21}]}}
+      selector:
+        object: {}
 
+patch_entity:
+  name: Patch single entity
+  description: Merge given data into one entity in the store and bump version.
+  fields:
+    entity_id:
+      name: Entity
+      description: The climate entity id to patch.
+      required: true
+      example: climate.kitchen
+      selector:
+        entity:
+          domain: climate
+    data:
+      name: Data
+      description: Fields to merge (e.g. defaultTemp, blocks).
+      required: true
+      example: >
+        {"defaultTemp":21,"blocks":[{"from":"17:00","to":"22:00","temp":22}]}
+      selector:
+        object: {}
+
+clear:
+  name: Clear store
+  description: Clear all schedules and bump version.
