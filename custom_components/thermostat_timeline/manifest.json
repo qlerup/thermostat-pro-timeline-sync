@@ -1,11 +1,11 @@
 {
   "domain": "thermostat_timeline",
   "name": "Thermostat Pro Timeline Sync",
-  "version": "0.1.0",
-  "documentation": "https://github.com/qlerup/thermostat-pro-timeline-sync",
-  "issue_tracker": "https://github.com/qlerup/thermostat-pro-timeline-sync/issues",
-  "requirements": [],
   "codeowners": ["@qlerup"],
   "config_flow": true,
-  "iot_class": "local_push"
+  "documentation": "https://github.com/qlerup/thermostat-pro-timeline-sync",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/qlerup/thermostat-pro-timeline-sync/issues",
+  "requirements": [],
+  "version": "1.0.0"
 }
