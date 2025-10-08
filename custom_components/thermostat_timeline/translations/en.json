@@ -1,0 +1,13 @@
+{
+  "title": "Thermostat Pro Timeline Sync",
+  "config": {
+    "abort": {
+      "single_instance_allowed": "Only a single instance is allowed."
+    },
+    "step": {
+      "user": {
+        "title": "Set up Thermostat Pro Timeline Sync"
+      }
+    }
+  }
+}
