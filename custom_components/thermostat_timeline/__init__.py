@@ -1,3 +1,8 @@
+from homeassistant.helpers import config_validation as cv
+from .const import DOMAIN  # hvis du allerede har DOMAIN i const.py
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 from __future__ import annotations
 import logging
 from homeassistant.core import HomeAssistant, ServiceCall
