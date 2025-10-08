@@ -7,4 +7,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hacs/action@main
         with:
-          category: integration   # <— vigtigtig! ikke "plugin"
+          category: integration
+          ignore: brands   # midlertidigt indtil brands-PR er merged
