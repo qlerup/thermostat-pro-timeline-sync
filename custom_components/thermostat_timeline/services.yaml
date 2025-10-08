@@ -13,7 +13,7 @@ set_store:
 
 patch_entity:
   name: Patch single entity
-  description: Merge given data into one entity in the store and bump version.
+  description: Merge given data into one entity and bump version.
   fields:
     entity_id:
       name: Entity
@@ -25,7 +25,7 @@ patch_entity:
           domain: climate
     data:
       name: Data
-      description: Fields to merge (e.g. defaultTemp, blocks).
+      description: Fields to merge (e.g., defaultTemp, blocks).
       required: true
       example: >
         {"defaultTemp":21,"blocks":[{"from":"17:00","to":"22:00","temp":22}]}
