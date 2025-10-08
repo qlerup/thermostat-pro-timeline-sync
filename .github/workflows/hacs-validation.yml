@@ -1,4 +1,4 @@
-name: HACS validate (plugin)
+name: HACS validate (integration)
 
 on:
   push:
