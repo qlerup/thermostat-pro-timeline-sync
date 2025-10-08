@@ -1,21 +1,10 @@
-name: HACS validate (integration)
-
-on:
-  push:
-  pull_request:
-  schedule:
-    - cron: "0 0 * * *"
-  workflow_dispatch:
-
-permissions: {}
+name: HACS Validation
+on: [push, pull_request]
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: HACS validation
-        uses: hacs/action@main
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
         with:
-          category: integration
+          category: integration   # <— vigtigtig! ikke "plugin"
