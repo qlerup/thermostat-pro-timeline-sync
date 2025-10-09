@@ -1,5 +1,6 @@
 name: HACS Validation
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+
 jobs:
   validate:
     runs-on: ubuntu-latest
