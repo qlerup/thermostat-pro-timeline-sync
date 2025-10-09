@@ -3,6 +3,9 @@
 Use together with **Thermostat Pro Timeline Card** (published separately).  
 This integration **synchronizes the Thermostat Timeline** across users and devices in Home Assistant, so everyone sees and uses the same schedule.
 
+<img width="767" height="932" alt="yimeline_sync" src="https://github.com/user-attachments/assets/f8661142-9504-49fc-829f-e19a7d8067c6" />
+
+
 ## Installation (HACS)
 1) HACS → Integrations → ⋯ → **Custom repositories**  
    URL: `https://github.com/qlerup/thermostat-pro-timeline-sync` • Category: **Integration`
