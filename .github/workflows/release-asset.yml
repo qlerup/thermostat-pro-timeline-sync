@@ -1,0 +1,62 @@
+name: Attach Integration ZIP to Release
+
+on:
+  release:
+    types: [published, prereleased]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    env:
+      INTEGRATION: thermostat-pro-timeline-sync
+      HACS_ZIP: thermostat-pro-timeline-sync.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required files exist
+        run: |
+          test -f custom_components/${{ env.INTEGRATION }}/manifest.json
+          test -f hacs.json
+
+      - name: Extract version from tag
+        id: ver
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          # strip leading "v" if present
+          VER="${TAG#v}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Update manifest.json with release version
+        run: |
+          jq --arg v "${{ steps.ver.outputs.version }}" '.version=$v' \
+            "custom_components/${{ env.INTEGRATION }}/manifest.json" \
+            > manifest.tmp
+          mv manifest.tmp "custom_components/${{ env.INTEGRATION }}/manifest.json"
+
+      # (valgfrit) commit version bump til repoet
+      # - uses: EndBug/add-and-commit@v9
+      #   with:
+      #     add: custom_components/${{ env.INTEGRATION }}/manifest.json
+      #     message: "chore: bump manifest to ${{ steps.ver.outputs.version }}"
+
+      - name: Build ZIPs for release (HACS + versioned)
+        run: |
+          mkdir -p dist
+          zip -r "dist/thermostat-pro-timeline-sync.zip" "custom_components/thermostat-pro-timeline-sync" \
+            -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
+          zip -r "dist/thermostat-pro-timeline-sync-${{ steps.ver.outputs.version }}.zip" \
+            "custom_components/thermostat-pro-timeline-sync" \
+            -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
+      
+      - name: Upload ZIP assets to release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            dist/thermostat-pro-timeline-sync.zip
+            dist/thermostat-pro-timeline-sync-${{ steps.ver.outputs.version }}.zip
+      
