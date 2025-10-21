@@ -5,9 +5,17 @@ set_store:
     schedules:
       name: Schedules
       description: Object mapping entity_id -> {defaultTemp, blocks:[...]}.
-      required: true
+      required: false
       example: >
         {"climate.kitchen":{"defaultTemp":20,"blocks":[{"from":"06:00","to":"08:00","temp":21}]}}
+      selector:
+        object: {}
+    settings:
+      name: Settings (optional)
+      description: Extra shared settings used by UI and background auto-apply.
+      required: false
+      example: >
+        {"min_temp":5,"max_temp":25,"away":{"enabled":true,"persons":["person.me"],"target_c":17},"merges":{"climate.living":["climate.living_2"]},"auto_apply_enabled":true}
       selector:
         object: {}
 
