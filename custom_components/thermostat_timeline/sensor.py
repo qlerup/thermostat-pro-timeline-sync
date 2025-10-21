@@ -44,5 +44,6 @@ class ThermostatTimelineOverview(SensorEntity):
     def extra_state_attributes(self):
         return {
             "schedules": self.hass.data[DOMAIN].get("schedules", {}),
+            "settings": self.hass.data[DOMAIN].get("settings", {}),
             "version": int(self.hass.data[DOMAIN].get("version", 1)),
         }
