@@ -45,10 +45,12 @@ jobs:
       - name: Build ZIPs for release (HACS + versioned)
         run: |
           mkdir -p dist
-          zip -r "dist/thermostat-pro-timeline-sync.zip" "custom_components/thermostat-pro-timeline-sync" \
+          BASENAME="${{ env.HACS_ZIP }}"
+          NAME_NO_EXT="${BASENAME%.zip}"
+          zip -r "dist/${BASENAME}" "custom_components/${{ env.INTEGRATION }}" \
             -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
-          zip -r "dist/thermostat-pro-timeline-sync-${{ steps.ver.outputs.version }}.zip" \
-            "custom_components/thermostat-pro-timeline-sync" \
+          zip -r "dist/${NAME_NO_EXT}-${{ steps.ver.outputs.version }}.zip" \
+            "custom_components/${{ env.INTEGRATION }}" \
             -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
       
       - name: Upload ZIP assets to release
@@ -59,4 +61,3 @@ jobs:
           files: |
             dist/thermostat-pro-timeline-sync.zip
             dist/thermostat-pro-timeline-sync-${{ steps.ver.outputs.version }}.zip
-      
