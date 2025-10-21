@@ -7,6 +7,10 @@ This integration **synchronizes the Thermostat Timeline** across users and devic
 
 
 ## Installation (HACS)
+
+[![Open this repository in HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=qlerup&repository=thermostat-pro-timeline-sync)
+
+
 1) HACS → Integrations → ⋯ → **Custom repositories**  
    URL: `https://github.com/qlerup/thermostat-pro-timeline-sync` • Category: **Integration`
 2) Install **Thermostat Pro Timeline Sync** and restart Home Assistant.
