@@ -36,29 +36,20 @@ jobs:
             > manifest.tmp
           mv manifest.tmp "custom_components/${{ env.INTEGRATION }}/manifest.json"
 
-      # (optional) commit version bump to repo
-      # - uses: EndBug/add-and-commit@v9
-      #   with:
-      #     add: custom_components/${{ env.INTEGRATION }}/manifest.json
-      #     message: "chore: bump manifest to ${{ steps.ver.outputs.version }}"
-
-      - name: Build ZIPs for release (HACS + versioned)
+      - name: Build ZIP for release (HACS only)
         run: |
           mkdir -p dist
           BASENAME="${{ env.HACS_ZIP }}"
-          NAME_NO_EXT="${BASENAME%.zip}"
-          # Change to the integration directory to avoid nesting custom_components
+          # Skift til integrationsmappen for at undgå ekstra "custom_components" i ZIP
           cd custom_components/${{ env.INTEGRATION }}
           zip -r "../../dist/${BASENAME}" . \
             -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
-          zip -r "../../dist/${NAME_NO_EXT}-${{ steps.ver.outputs.version }}.zip" . \
-            -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
-      
-      - name: Upload ZIP assets to release
+
+      - name: Upload ZIP asset to release
         uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: |
             dist/thermostat-pro-timeline-sync.zip
-            dist/thermostat-pro-timeline-sync-${{ steps.ver.outputs.version }}.zip
+          fail_on_unmatched_files: true
