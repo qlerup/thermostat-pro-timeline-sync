@@ -7,7 +7,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
-from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change
+from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
 
@@ -311,8 +311,8 @@ class AutoApplyManager:
         persons = away.get("persons") if isinstance(away, dict) else None
         if away.get("enabled") and isinstance(persons, list) and persons:
             @callback
-            def _ch(_entity, _old, _new):
+            def _ch(event):
                 # Apply immediately when presence changes
                 self.hass.async_create_task(self._maybe_apply_now(force=True))
                 self.hass.async_create_task(self._schedule_next())
-            self._unsub_persons = async_track_state_change(self.hass, persons, _ch)
+            self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
