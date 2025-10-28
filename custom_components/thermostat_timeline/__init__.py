@@ -82,6 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(DOMAIN, "set_store", set_store)
     hass.services.async_register(DOMAIN, "patch_entity", patch_entity)
     hass.services.async_register(DOMAIN, "clear", clear)
+    # no apply_now service (removed)
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
 
@@ -217,7 +218,7 @@ class AutoApplyManager:
             pass
         return want
 
-    async def _maybe_apply_now(self, force: bool = False):
+    async def _maybe_apply_now(self, force: bool = False, boundary_only: bool = False):
         if not self._auto_apply_enabled():
             return
         schedules, settings = self._get_data()
@@ -230,6 +231,28 @@ class AutoApplyManager:
                 continue
             if not self.hass.states.get(eid):
                 continue
+            # If we are at a boundary tick (timer), only apply for entities that have a boundary now
+            if boundary_only:
+                try:
+                    primary = None
+                    if eid in schedules:
+                        primary = eid
+                    else:
+                        for p, lst in (merges.items() if isinstance(merges, dict) else []):
+                            try:
+                                if eid in (lst or []):
+                                    primary = p
+                                    break
+                            except Exception:
+                                continue
+                    if primary is None:
+                        primary = eid
+                    row = schedules.get(primary) or {}
+                    if not self._entity_has_boundary_now(row, now_min):
+                        continue
+                except Exception:
+                    # if in doubt, skip to avoid overriding manual changes unnecessarily
+                    continue
             desired = self._desired_for(eid, schedules, settings, now_min)
             if desired is None:
                 continue
@@ -298,7 +321,8 @@ class AutoApplyManager:
         self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
 
     async def _timer_fire(self):
-        await self._maybe_apply_now(force=True)
+        # At scheduled boundary, only apply for entities that have a boundary at this minute
+        await self._maybe_apply_now(force=True, boundary_only=True)
         await self._schedule_next()
 
     def _reset_person_watch(self):
@@ -316,3 +340,18 @@ class AutoApplyManager:
                 self.hass.async_create_task(self._maybe_apply_now(force=True))
                 self.hass.async_create_task(self._schedule_next())
             self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
+
+    def _entity_has_boundary_now(self, row: dict, now_min: int) -> bool:
+        try:
+            blocks = self._effective_blocks_today(row)
+            for b in blocks:
+                try:
+                    s = int(b.get("startMin", -1))
+                    e = int(b.get("endMin", -1))
+                    if s == now_min or e == now_min:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
