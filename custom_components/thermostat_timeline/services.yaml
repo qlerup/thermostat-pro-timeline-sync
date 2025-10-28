@@ -43,3 +43,4 @@ patch_entity:
 clear:
   name: Clear store
   description: Clear all schedules and bump version.
+
