@@ -102,6 +102,7 @@ class AutoApplyManager:
         self._unsub_timer = None
         self._unsub_persons = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
+        self._next_is_resume = False
 
     async def async_start(self):
         # Apply once on startup and schedule next if enabled
@@ -128,7 +129,33 @@ class AutoApplyManager:
 
     def _auto_apply_enabled(self) -> bool:
         _s, settings = self._get_data()
-        return bool(settings.get("auto_apply_enabled"))
+        if not bool(settings.get("auto_apply_enabled")):
+            return False
+        # Pause gates
+        try:
+            if bool(settings.get("pause_indef")):
+                return False
+            pu = settings.get("pause_until_ms")
+            if isinstance(pu, (int, float)):
+                # compare in ms
+                now_ms = dt_util.utcnow().timestamp() * 1000.0
+                if float(pu) > now_ms:
+                    return False
+        except Exception:
+            pass
+        return True
+
+    def _paused_until_dt(self):
+        _s, settings = self._get_data()
+        try:
+            if bool(settings.get("pause_indef")):
+                return None
+            pu = settings.get("pause_until_ms")
+            if isinstance(pu, (int, float)) and float(pu) > 0:
+                return dt_util.utc_from_timestamp(float(pu) / 1000.0)
+        except Exception:
+            pass
+        return None
 
     def _now_min(self) -> int:
         now = dt_util.now()
@@ -313,16 +340,37 @@ class AutoApplyManager:
             self._unsub_timer()
             self._unsub_timer = None
         if not self._auto_apply_enabled():
-            return
-        when = self._next_boundary_dt()
+            # If paused indefinitely, do not schedule anything
+            _s, settings = self._get_data()
+            if bool(settings.get("pause_indef")):
+                return
+            # If paused until a time, schedule wake-up then
+            wake = self._paused_until_dt()
+            if not wake:
+                return
+            boundary = None
+        else:
+            wake = self._paused_until_dt()
+            boundary = self._next_boundary_dt()
+        # choose earliest available
+        if wake and boundary:
+            self._next_is_resume = wake <= boundary
+            when = wake if self._next_is_resume else boundary
+        elif wake:
+            self._next_is_resume = True
+            when = wake
+        else:
+            self._next_is_resume = False
+            when = boundary
         @callback
         def _cb(_now):
             self.hass.async_create_task(self._timer_fire())
         self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
 
     async def _timer_fire(self):
-        # At scheduled boundary, only apply for entities that have a boundary at this minute
-        await self._maybe_apply_now(force=True, boundary_only=True)
+        # If this wake was caused by pause expiry, apply immediately across all entities
+        await self._maybe_apply_now(force=True, boundary_only=(not self._next_is_resume))
+        self._next_is_resume = False
         await self._schedule_next()
 
     def _reset_person_watch(self):
