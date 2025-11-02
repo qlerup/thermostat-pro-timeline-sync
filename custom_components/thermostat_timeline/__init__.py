@@ -12,6 +12,7 @@ from homeassistant.util import dt as dt_util
 from datetime import timedelta
 
 from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED
+from homeassistant.helpers import entity_registry as er
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
@@ -40,12 +41,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["version"] = int(data.get("version", 1))
 
     async def _save_and_broadcast():
-        await store.async_save({
-            "schedules": hass.data[DOMAIN]["schedules"],
-            "settings": hass.data[DOMAIN].get("settings", {}),
-            "version": hass.data[DOMAIN]["version"],
-        })
+        # Broadcast first so UI updates immediately
         async_dispatcher_send(hass, SIGNAL_UPDATED)
+        # Proactively nudge the overview sensor to update its state in HA
+        try:
+            ent_reg = er.async_get(hass)
+            sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
+            if sensor_eid:
+                await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
+        except Exception:
+            pass
+        try:
+            await store.async_save({
+                "schedules": hass.data[DOMAIN]["schedules"],
+                "settings": hass.data[DOMAIN].get("settings", {}),
+                "version": hass.data[DOMAIN]["version"],
+            })
+        except Exception:
+            # Storage failure shouldn't block UI update
+            _LOGGER.warning("%s: failed to save store after broadcast", DOMAIN)
 
     async def set_store(call: ServiceCall):
         if "schedules" in call.data:
@@ -166,7 +180,18 @@ class AutoApplyManager:
         idx = (dt_util.now().weekday())  # 0..6
         return ["mon","tue","wed","thu","fri","sat","sun"][idx]
 
-    def _effective_blocks_today(self, row: dict):
+    def _effective_blocks_today(self, row: dict, settings: dict):
+        # Profiles override take precedence when enabled (per-room activeProfile)
+        try:
+            if settings.get("profiles_enabled"):
+                ap = row.get("activeProfile")
+                if ap:
+                    profs = row.get("profiles") or {}
+                    blk = (profs.get(ap) or {}).get("blocks")
+                    if isinstance(blk, list):
+                        return blk
+        except Exception:
+            pass
         # If row has weekly structure, use today's day list, otherwise default blocks
         try:
             wk = row.get("weekly")
@@ -208,7 +233,7 @@ class AutoApplyManager:
         row = schedules.get(primary)
         if not isinstance(row, dict):
             return None
-        blocks = self._effective_blocks_today(row)
+        blocks = self._effective_blocks_today(row, settings)
         hit = None
         for b in blocks:
             try:
@@ -313,7 +338,7 @@ class AutoApplyManager:
         # consider all block boundaries today
         for eid, row in schedules.items():
             try:
-                blocks = self._effective_blocks_today(row)
+                blocks = self._effective_blocks_today(row, settings)
                 for b in blocks:
                     for t in (int(b.get("startMin", -1)), int(b.get("endMin", -1))):
                         if t < 0:
@@ -391,7 +416,8 @@ class AutoApplyManager:
 
     def _entity_has_boundary_now(self, row: dict, now_min: int) -> bool:
         try:
-            blocks = self._effective_blocks_today(row)
+            _s, settings = self._get_data()
+            blocks = self._effective_blocks_today(row, settings)
             for b in blocks:
                 try:
                     s = int(b.get("startMin", -1))
