@@ -2,3 +2,4 @@ DOMAIN = "thermostat_timeline"
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 1
 SIGNAL_UPDATED = f"{DOMAIN}_updated"
+BACKUP_STORAGE_KEY = f"{DOMAIN}_backup"
