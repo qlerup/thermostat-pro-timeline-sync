@@ -11,7 +11,7 @@ from homeassistant.helpers.event import async_track_point_in_utc_time, async_tra
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
 
-from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED
+from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
 from homeassistant.helpers import entity_registry as er
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -33,12 +33,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     store = Store(hass, STORAGE_VERSION, f"{STORAGE_KEY}.json")
     data = await store.async_load() or {}
+    backup_store = Store(hass, STORAGE_VERSION, f"{BACKUP_STORAGE_KEY}.json")
+    backup_data = await backup_store.async_load() or {}
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
     hass.data[DOMAIN]["schedules"] = data.get("schedules", {})
     hass.data[DOMAIN]["settings"] = data.get("settings", {})
     hass.data[DOMAIN]["version"] = int(data.get("version", 1))
+    # Backup payloads
+    hass.data[DOMAIN]["backup_schedules"] = backup_data.get("schedules", {})
+    hass.data[DOMAIN]["backup_settings"] = backup_data.get("settings", {})
+    hass.data[DOMAIN]["backup_version"] = int(backup_data.get("version", 1))
+    hass.data[DOMAIN]["backup_last_ts"] = backup_data.get("last_backup_ts")
 
     async def _save_and_broadcast():
         # Broadcast first so UI updates immediately
@@ -61,18 +68,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Storage failure shouldn't block UI update
             _LOGGER.warning("%s: failed to save store after broadcast", DOMAIN)
 
+    async def _save_backup():
+        # Broadcast so backup sensor updates
+        async_dispatcher_send(hass, SIGNAL_UPDATED)
+        try:
+            await backup_store.async_save({
+                "schedules": hass.data[DOMAIN].get("backup_schedules", {}),
+                "settings": hass.data[DOMAIN].get("backup_settings", {}),
+                "version": hass.data[DOMAIN].get("backup_version", 1),
+                "last_backup_ts": hass.data[DOMAIN].get("backup_last_ts"),
+            })
+            # Proactively nudge the backup sensor to update its state in HA
+            try:
+                ent_reg = er.async_get(hass)
+                sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_backup")
+                if sensor_eid:
+                    await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
+            except Exception:
+                pass
+        except Exception:
+            _LOGGER.warning("%s: failed to save backup store", DOMAIN)
+
     async def set_store(call: ServiceCall):
+        force = bool(call.data.get("force"))
+        cur_sched = hass.data[DOMAIN].get("schedules", {})
+        cur_set = hass.data[DOMAIN].get("settings", {})
+        changed = False
         if "schedules" in call.data:
             schedules = call.data.get("schedules")
             if not isinstance(schedules, dict):
                 _LOGGER.warning("%s.set_store: schedules must be an object when provided", DOMAIN)
                 return
-            hass.data[DOMAIN]["schedules"] = schedules
+            if schedules != cur_sched:
+                hass.data[DOMAIN]["schedules"] = schedules
+                changed = True
         # Optional settings payload
-        settings = call.data.get("settings")
-        if isinstance(settings, dict):
-            hass.data[DOMAIN]["settings"] = settings
+        if "settings" in call.data:
+            settings = call.data.get("settings")
+            if isinstance(settings, dict) and settings != cur_set:
+                hass.data[DOMAIN]["settings"] = settings
+                changed = True
+        if not changed and not force:
+            # No-op: nothing changed and not forced; avoid spurious version bump/apply
+            return
         hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        await _save_and_broadcast()
+
+    async def backup_now(call: ServiceCall):
+        # Copy current schedules/settings into backup
+        hass.data[DOMAIN]["backup_schedules"] = dict(hass.data[DOMAIN].get("schedules", {}))
+        hass.data[DOMAIN]["backup_settings"] = dict(hass.data[DOMAIN].get("settings", {}))
+        hass.data[DOMAIN]["backup_version"] = int(hass.data[DOMAIN].get("backup_version", 1)) + 1
+        try:
+            hass.data[DOMAIN]["backup_last_ts"] = dt_util.utcnow().isoformat()
+        except Exception:
+            pass
+        await _save_backup()
+
+    async def restore_now(call: ServiceCall):
+        # Copy backup into main and broadcast (triggers frontend reload)
+        hass.data[DOMAIN]["schedules"] = dict(hass.data[DOMAIN].get("backup_schedules", {}))
+        hass.data[DOMAIN]["settings"] = dict(hass.data[DOMAIN].get("backup_settings", {}))
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
         await _save_and_broadcast()
 
     async def patch_entity(call: ServiceCall):
@@ -94,6 +151,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _save_and_broadcast()
 
     hass.services.async_register(DOMAIN, "set_store", set_store)
+    hass.services.async_register(DOMAIN, "backup_now", backup_now)
+    hass.services.async_register(DOMAIN, "restore_now", restore_now)
     hass.services.async_register(DOMAIN, "patch_entity", patch_entity)
     hass.services.async_register(DOMAIN, "clear", clear)
     # no apply_now service (removed)
@@ -104,6 +163,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     mgr = AutoApplyManager(hass)
     hass.data[DOMAIN]["manager"] = mgr
     await mgr.async_start()
+    # ---- Backup Manager (auto backup) ----
+    bkm = BackupManager(hass, backup_cb=backup_now)
+    hass.data[DOMAIN]["backup_manager"] = bkm
+    await bkm.async_start()
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -131,7 +194,10 @@ class AutoApplyManager:
         self._reset_person_watch()
 
     async def _on_store_changed(self):
-        await self._maybe_apply_now(force=True)
+        # Respect apply_on_edit toggle: only apply immediately on store changes when enabled
+        _s, settings = self._get_data()
+        if bool(settings.get("apply_on_edit", True)):
+            await self._maybe_apply_now(force=True)
         await self._schedule_next()
         self._reset_person_watch()
 
@@ -415,17 +481,85 @@ class AutoApplyManager:
             self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
 
     def _entity_has_boundary_now(self, row: dict, now_min: int) -> bool:
+        """Return True if the entity has a block boundary at (or just before) now.
+
+        The timer intentionally schedules a few seconds/minutes past the exact
+        boundary to avoid immediate execution collisions. That means the check
+        here must tolerate a small offset, otherwise we miss the boundary and
+        never apply. We therefore consider the current minute and the previous
+        minute as being "at the boundary".
+        """
         try:
             _s, settings = self._get_data()
             blocks = self._effective_blocks_today(row, settings)
+            # allow a 1‑minute grace window (handle wraparound at midnight)
+            prev_min = (now_min - 1) % 1440
             for b in blocks:
                 try:
                     s = int(b.get("startMin", -1))
                     e = int(b.get("endMin", -1))
-                    if s == now_min or e == now_min:
+                    if s in (now_min, prev_min) or e in (now_min, prev_min):
                         return True
                 except Exception:
                     continue
         except Exception:
             pass
         return False
+
+
+class BackupManager:
+    def __init__(self, hass: HomeAssistant, backup_cb):
+        self.hass = hass
+        self._unsub_timer = None
+        self._backup_cb = backup_cb
+
+    def _settings(self):
+        d = self.hass.data.get(DOMAIN, {})
+        return d.get("settings", {})
+
+    def _enabled(self) -> bool:
+        s = self._settings()
+        return bool(s.get("backup_auto_enabled", False))
+
+    def _interval_min(self) -> int:
+        s = self._settings()
+        # Prefer days; fallback to minutes for backward compat
+        try:
+            if "backup_interval_days" in s:
+                d = max(1, min(365, int(s.get("backup_interval_days", 1))))
+                return d * 1440
+        except Exception:
+            pass
+        try:
+            v = int(s.get("backup_interval_min", 1440))
+            return max(1440, min(365*1440, v))
+        except Exception:
+            return 1440
+
+    async def async_start(self):
+        await self._schedule_next()
+        # Re-schedule on any store update
+        @callback
+        def _on_update():
+            self.hass.async_create_task(self._schedule_next())
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
+
+    async def _schedule_next(self):
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+        if not self._enabled():
+            return
+        mins = self._interval_min()
+        when = dt_util.utcnow() + timedelta(minutes=mins)
+        @callback
+        def _cb(_now):
+            self.hass.async_create_task(self._do_backup())
+        self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
+
+    async def _do_backup(self):
+        try:
+            await self._backup_cb(ServiceCall(DOMAIN, "backup_now", {}))
+        except Exception:
+            _LOGGER.warning("%s: auto backup failed", DOMAIN)
+        await self._schedule_next()
