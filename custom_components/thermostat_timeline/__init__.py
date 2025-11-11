@@ -247,6 +247,18 @@ class AutoApplyManager:
         return ["mon","tue","wed","thu","fri","sat","sun"][idx]
 
     def _effective_blocks_today(self, row: dict, settings: dict):
+        # Presence (advanced away) overrides if enabled and an active combo exists
+        try:
+            away = settings.get("away") or {}
+            if bool(away.get("advanced_enabled")):
+                key = self._active_presence_combo_key(settings)
+                if key:
+                    pres = row.get("presence") or {}
+                    blk = (pres.get(key) or {}).get("blocks")
+                    if isinstance(blk, list):
+                        return blk
+        except Exception:
+            pass
         # Profiles override take precedence when enabled (per-room activeProfile)
         try:
             if settings.get("profiles_enabled"):
@@ -269,6 +281,46 @@ class AutoApplyManager:
         except Exception:
             pass
         return row.get("blocks") or []
+
+    def _presence_persons(self, settings: dict) -> list[str]:
+        try:
+            away = settings.get("away") or {}
+            persons = away.get("persons")
+            return list(persons) if isinstance(persons, list) else []
+        except Exception:
+            return []
+
+    def _presence_combo_key(self, home: list[str], away: list[str]) -> str:
+        try:
+            h = sorted([str(x) for x in (home or [])])
+            a = sorted([str(x) for x in (away or [])])
+            return f"H:{','.join(h)}|A:{','.join(a)}"
+        except Exception:
+            return "H:|A:"
+
+    def _active_presence_combo_key(self, settings: dict) -> str | None:
+        try:
+            away = settings.get("away") or {}
+            if not bool(away.get("advanced_enabled")):
+                return None
+            persons = self._presence_persons(settings)
+            if not persons:
+                return None
+            home, not_home = [], []
+            for p in persons:
+                st = self.hass.states.get(p)
+                if st and str(st.state).lower() == "home":
+                    home.append(p)
+                else:
+                    not_home.append(p)
+            key = self._presence_combo_key(home, not_home)
+            combos = (away.get("combos") or {}) if isinstance(away, dict) else {}
+            meta = combos.get(key)
+            if meta and bool(meta.get("enabled")):
+                return key
+            return None
+        except Exception:
+            return None
 
     def _all_targets(self, schedules: dict, merges: dict) -> set[str]:
         out = set()
@@ -309,10 +361,12 @@ class AutoApplyManager:
             except Exception:
                 continue
         want = float(hit.get("temp")) if hit is not None else float(row.get("defaultTemp", 20))
-        # Away override
+        # Away override (disabled when advanced presence is enabled)
         try:
             away = settings.get("away") or {}
-            if away.get("enabled") and isinstance(away.get("persons"), list):
+            if bool(away.get("advanced_enabled")):
+                pass  # advanced presence replaces simple away clamp entirely
+            elif away.get("enabled") and isinstance(away.get("persons"), list):
                 anyone_home = False
                 for p in away["persons"]:
                     st = self.hass.states.get(p)
@@ -465,14 +519,14 @@ class AutoApplyManager:
         await self._schedule_next()
 
     def _reset_person_watch(self):
-        # Recreate person watcher based on settings.away.persons
+        # Recreate person watcher based on settings.away.persons (both simple away and advanced presence)
         if self._unsub_persons:
             self._unsub_persons()
             self._unsub_persons = None
         _schedules, settings = self._get_data()
         away = settings.get("away") or {}
         persons = away.get("persons") if isinstance(away, dict) else None
-        if away.get("enabled") and isinstance(persons, list) and persons:
+        if (away.get("enabled") or away.get("advanced_enabled")) and isinstance(persons, list) and persons:
             @callback
             def _ch(event):
                 # Apply immediately when presence changes
