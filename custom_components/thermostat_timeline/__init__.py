@@ -255,8 +255,16 @@ class AutoApplyManager:
                 if key:
                     pres = row.get("presence") or {}
                     blk = (pres.get(key) or {}).get("blocks")
-                    if isinstance(blk, list):
+                    if isinstance(blk, list) and len(blk) > 0:
                         return blk
+                    # Presence combo is active but this room has no presence schedule:
+                    # return a virtual all‑day block at Away temperature
+                    try:
+                        target = float(away.get("target_c")) if "target_c" in away else None
+                        if target is not None:
+                            return [{"id": "__presence_away__", "startMin": 0, "endMin": 1440, "temp": target}]
+                    except Exception:
+                        pass
         except Exception:
             pass
         # Profiles override take precedence when enabled (per-room activeProfile)
@@ -351,7 +359,18 @@ class AutoApplyManager:
         row = schedules.get(primary)
         if not isinstance(row, dict):
             return None
+        # Determine which blocks are effective for today
         blocks = self._effective_blocks_today(row, settings)
+        # Track if advanced presence is active globally and whether this room has a presence schedule for the active combo
+        presence_key_active = self._active_presence_combo_key(settings)
+        room_has_presence_blocks = False
+        try:
+            if presence_key_active:
+                pres = row.get("presence") or {}
+                bl = (pres.get(presence_key_active) or {}).get("blocks")
+                room_has_presence_blocks = isinstance(bl, list) and len(bl) > 0
+        except Exception:
+            room_has_presence_blocks = False
         hit = None
         for b in blocks:
             try:
@@ -360,7 +379,23 @@ class AutoApplyManager:
                     break
             except Exception:
                 continue
-        want = float(hit.get("temp")) if hit is not None else float(row.get("defaultTemp", 20))
+        # Base desired setpoint
+        if hit is not None:
+            want = float(hit.get("temp"))
+        else:
+            # When advanced presence is active but this room has no presence schedule,
+            # use Away temperature instead of the room default.
+            if presence_key_active and not room_has_presence_blocks:
+                try:
+                    away = settings.get("away") or {}
+                    if "target_c" in away:
+                        want = float(away.get("target_c"))
+                    else:
+                        want = float(row.get("defaultTemp", 20))
+                except Exception:
+                    want = float(row.get("defaultTemp", 20))
+            else:
+                want = float(row.get("defaultTemp", 20))
         # Away override (disabled when advanced presence is enabled)
         try:
             away = settings.get("away") or {}
