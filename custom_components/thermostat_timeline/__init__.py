@@ -46,6 +46,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["backup_settings"] = backup_data.get("settings", {})
     hass.data[DOMAIN]["backup_version"] = int(backup_data.get("version", 1))
     hass.data[DOMAIN]["backup_last_ts"] = backup_data.get("last_backup_ts")
+    # Track whether the backup is partial and which sections it includes
+    hass.data[DOMAIN]["backup_partial_flags"] = backup_data.get("partial_flags")
 
     async def _save_and_broadcast():
         # Broadcast first so UI updates immediately
@@ -77,6 +79,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "settings": hass.data[DOMAIN].get("backup_settings", {}),
                 "version": hass.data[DOMAIN].get("backup_version", 1),
                 "last_backup_ts": hass.data[DOMAIN].get("backup_last_ts"),
+                "partial_flags": hass.data[DOMAIN].get("backup_partial_flags"),
             })
             # Proactively nudge the backup sensor to update its state in HA
             try:
@@ -115,9 +118,97 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _save_and_broadcast()
 
     async def backup_now(call: ServiceCall):
-        # Copy current schedules/settings into backup
-        hass.data[DOMAIN]["backup_schedules"] = dict(hass.data[DOMAIN].get("schedules", {}))
-        hass.data[DOMAIN]["backup_settings"] = dict(hass.data[DOMAIN].get("settings", {}))
+        """Create a backup of the current store.
+
+        Supports selective sections via optional booleans:
+          - main: base daily schedules (defaultTemp, blocks, profiles)
+          - weekday: weekday schedules (weekly, weekly_modes)
+          - presence: presence schedules (advanced away combos per room)
+          - settings: editor/global settings (except color ranges)
+          - holiday: holiday schedules per room
+          - colors: color ranges and color mode
+        If no flags are provided, a full backup is made (backwards compatible).
+        """
+        # Determine requested sections (default: all True)
+        want_main = bool(call.data.get("main", True))
+        want_week = bool(call.data.get("weekday", True))
+        want_presence = bool(call.data.get("presence", True))
+        want_settings = bool(call.data.get("settings", True))
+        want_holiday = bool(call.data.get("holiday", True))
+        want_colors = bool(call.data.get("colors", True))
+
+        src_sched = hass.data[DOMAIN].get("schedules", {}) or {}
+        src_set = hass.data[DOMAIN].get("settings", {}) or {}
+
+        # Build selective schedules
+        out_sched: dict = {}
+        if any([want_main, want_week, want_presence, want_holiday]):
+            for eid, row in (src_sched.items() if isinstance(src_sched, dict) else []):
+                if not isinstance(row, dict):
+                    continue
+                new_row = {}
+                if want_main:
+                    if "defaultTemp" in row:
+                        new_row["defaultTemp"] = row["defaultTemp"]
+                    if "blocks" in row:
+                        new_row["blocks"] = row["blocks"]
+                    # Include profiles data in main
+                    if "profiles" in row:
+                        new_row["profiles"] = row["profiles"]
+                    if "activeProfile" in row:
+                        new_row["activeProfile"] = row["activeProfile"]
+                if want_week:
+                    if "weekly" in row:
+                        new_row["weekly"] = row["weekly"]
+                    if "weekly_modes" in row:
+                        new_row["weekly_modes"] = row["weekly_modes"]
+                if want_presence and "presence" in row:
+                    new_row["presence"] = row["presence"]
+                if want_holiday and "holiday" in row:
+                    new_row["holiday"] = row["holiday"]
+                if new_row:
+                    out_sched[eid] = new_row
+
+        # Build selective settings
+        out_set: dict = {}
+        if want_settings:
+            # Copy all settings except colors (handled below)
+            for k, v in (src_set.items() if isinstance(src_set, dict) else []):
+                if k in ("color_ranges", "color_global"):
+                    continue
+                out_set[k] = v
+        if want_colors:
+            if "color_ranges" in src_set:
+                out_set["color_ranges"] = src_set["color_ranges"]
+            if "color_global" in src_set:
+                out_set["color_global"] = src_set["color_global"]
+
+        # If no flags explicitly provided (legacy), store a full backup
+        legacy_full = (
+            "main" not in call.data
+            and "weekday" not in call.data
+            and "presence" not in call.data
+            and "settings" not in call.data
+            and "holiday" not in call.data
+            and "colors" not in call.data
+        )
+
+        if legacy_full:
+            hass.data[DOMAIN]["backup_schedules"] = dict(src_sched)
+            hass.data[DOMAIN]["backup_settings"] = dict(src_set)
+            hass.data[DOMAIN]["backup_partial_flags"] = None
+        else:
+            hass.data[DOMAIN]["backup_schedules"] = out_sched
+            hass.data[DOMAIN]["backup_settings"] = out_set
+            hass.data[DOMAIN]["backup_partial_flags"] = {
+                "main": want_main,
+                "weekday": want_week,
+                "presence": want_presence,
+                "settings": want_settings,
+                "holiday": want_holiday,
+                "colors": want_colors,
+            }
+
         hass.data[DOMAIN]["backup_version"] = int(hass.data[DOMAIN].get("backup_version", 1)) + 1
         try:
             hass.data[DOMAIN]["backup_last_ts"] = dt_util.utcnow().isoformat()
@@ -126,9 +217,86 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await _save_backup()
 
     async def restore_now(call: ServiceCall):
-        # Copy backup into main and broadcast (triggers frontend reload)
-        hass.data[DOMAIN]["schedules"] = dict(hass.data[DOMAIN].get("backup_schedules", {}))
-        hass.data[DOMAIN]["settings"] = dict(hass.data[DOMAIN].get("backup_settings", {}))
+        """Restore from backup.
+
+        Optional mode: 'replace' (default) or 'merge'.
+        Optional section flags like backup_now: main, weekday, presence, settings, holiday, colors.
+        If backup contains partial_flags and no mode is provided, merge is used by default.
+        """
+        mode = str(call.data.get("mode", "")).lower().strip()
+        flags = hass.data[DOMAIN].get("backup_partial_flags") or {}
+        # Allow caller to override flags
+        for key in ("main","weekday","presence","settings","holiday","colors"):
+            if key in call.data:
+                flags[key] = bool(call.data.get(key))
+
+        backup_sched = hass.data[DOMAIN].get("backup_schedules", {}) or {}
+        backup_set = hass.data[DOMAIN].get("backup_settings", {}) or {}
+
+        # If no flags and mode empty, keep legacy behavior (replace)
+        if not flags and mode not in ("merge", "replace"):
+            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
+            hass.data[DOMAIN]["settings"] = dict(backup_set)
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+            await _save_and_broadcast()
+            return
+
+        do_merge = (mode == "merge") or (not mode and bool(flags))
+        if not do_merge:
+            # Explicit replace
+            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
+            hass.data[DOMAIN]["settings"] = dict(backup_set)
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+            await _save_and_broadcast()
+            return
+
+        # Merge: only update selected sections/keys
+        cur_sched = hass.data[DOMAIN].get("schedules", {}) or {}
+        cur_set = hass.data[DOMAIN].get("settings", {}) or {}
+
+        want_main = bool(flags.get("main", False))
+        want_week = bool(flags.get("weekday", False))
+        want_presence = bool(flags.get("presence", False))
+        want_settings = bool(flags.get("settings", False))
+        want_holiday = bool(flags.get("holiday", False))
+        want_colors = bool(flags.get("colors", False))
+
+        if any([want_main, want_week, want_presence, want_holiday]):
+            for eid, brow in (backup_sched.items() if isinstance(backup_sched, dict) else []):
+                if not isinstance(brow, dict):
+                    continue
+                row = dict(cur_sched.get(eid, {}))
+                if want_main:
+                    if "defaultTemp" in brow:
+                        row["defaultTemp"] = brow["defaultTemp"]
+                    if "blocks" in brow:
+                        row["blocks"] = brow["blocks"]
+                    if "profiles" in brow:
+                        row["profiles"] = brow["profiles"]
+                    if "activeProfile" in brow:
+                        row["activeProfile"] = brow["activeProfile"]
+                if want_week:
+                    if "weekly" in brow:
+                        row["weekly"] = brow["weekly"]
+                    if "weekly_modes" in brow:
+                        row["weekly_modes"] = brow["weekly_modes"]
+                if want_presence and "presence" in brow:
+                    row["presence"] = brow["presence"]
+                if want_holiday and "holiday" in brow:
+                    row["holiday"] = brow["holiday"]
+                cur_sched[eid] = row
+
+        if want_settings or want_colors:
+            # Merge settings keys
+            for k, v in (backup_set.items() if isinstance(backup_set, dict) else []):
+                if (k in ("color_ranges", "color_global")) and not want_colors:
+                    continue
+                if (k not in ("color_ranges", "color_global")) and not want_settings:
+                    continue
+                cur_set[k] = v
+
+        hass.data[DOMAIN]["schedules"] = cur_sched
+        hass.data[DOMAIN]["settings"] = cur_set
         hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
         await _save_and_broadcast()
 
