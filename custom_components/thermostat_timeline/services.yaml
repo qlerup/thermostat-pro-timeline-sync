@@ -44,3 +44,102 @@ clear:
   name: Clear store
   description: Clear all schedules and bump version.
 
+backup_now:
+  name: Backup now
+  description: Create a backup of schedules/settings. Supports selecting sections.
+  fields:
+    main:
+      name: Main schedules
+      description: Include base daily schedules (defaultTemp, blocks, profiles).
+      required: false
+      default: true
+      selector:
+        boolean: {}
+    weekday:
+      name: Weekday schedules
+      description: Include weekday schedules (weekly, weekly_modes).
+      required: false
+      default: true
+      selector:
+        boolean: {}
+    presence:
+      name: Presence schedules
+      description: Include presence schedules (advanced away per room).
+      required: false
+      default: true
+      selector:
+        boolean: {}
+    settings:
+      name: Editor settings
+      description: Include editor/global settings (excluding colors).
+      required: false
+      default: true
+      selector:
+        boolean: {}
+    holiday:
+      name: Holiday schedules
+      description: Include holiday schedules per room.
+      required: false
+      default: true
+      selector:
+        boolean: {}
+    colors:
+      name: Color blocks
+      description: Include color ranges and color mode.
+      required: false
+      default: true
+      selector:
+        boolean: {}
+
+restore_now:
+  name: Restore now
+  description: Restore from backup. Can merge only selected sections.
+  fields:
+    mode:
+      name: Mode
+      description: Use 'merge' to merge selected sections, or 'replace' to fully overwrite.
+      required: false
+      example: merge
+      selector:
+        select:
+          options:
+            - merge
+            - replace
+          mode: dropdown
+    main:
+      name: Main schedules
+      description: Restore base daily schedules (defaultTemp, blocks, profiles).
+      required: false
+      selector:
+        boolean: {}
+    weekday:
+      name: Weekday schedules
+      description: Restore weekday schedules (weekly, weekly_modes).
+      required: false
+      selector:
+        boolean: {}
+    presence:
+      name: Presence schedules
+      description: Restore presence schedules.
+      required: false
+      selector:
+        boolean: {}
+    settings:
+      name: Editor settings
+      description: Restore editor/global settings (excluding colors).
+      required: false
+      selector:
+        boolean: {}
+    holiday:
+      name: Holiday schedules
+      description: Restore holiday schedules per room.
+      required: false
+      selector:
+        boolean: {}
+    colors:
+      name: Color blocks
+      description: Restore color ranges and color mode.
+      required: false
+      selector:
+        boolean: {}
+
