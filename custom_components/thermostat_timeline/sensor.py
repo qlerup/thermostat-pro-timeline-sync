@@ -85,4 +85,5 @@ class ThermostatTimelineBackup(SensorEntity):
             "settings": self.hass.data[DOMAIN].get("backup_settings", {}),
             "version": int(self.hass.data[DOMAIN].get("backup_version", 1)),
             "last_backup_ts": self.hass.data[DOMAIN].get("backup_last_ts"),
+            "partial_flags": self.hass.data[DOMAIN].get("backup_partial_flags"),
         }
