@@ -645,12 +645,10 @@ class AutoApplyManager:
             if cur is not None and abs(cur - float(desired)) < 0.05:
                 self._last_applied[eid] = {"min": now_min, "temp": float(desired)}
                 continue
-            try:
-                await self.hass.services.async_call(
-                    "climate", "set_temperature", {"entity_id": eid, "temperature": float(desired)}, blocking=False
-                )
+            ok = await self._apply_setpoint(eid, float(desired))
+            if ok:
                 self._last_applied[eid] = {"min": now_min, "temp": float(desired)}
-            except Exception:
+            else:
                 _LOGGER.warning("Auto-apply failed for %s", eid)
 
     def _next_boundary_dt(self):
@@ -762,6 +760,98 @@ class AutoApplyManager:
         except Exception:
             pass
         return False
+
+    async def _apply_setpoint(self, eid: str, desired: float) -> bool:
+        """Apply desired setpoint robustly across HVAC modes.
+
+        Strategy:
+        - If device exposes range (target_temp_low/high) and mode is heat_cool/auto, set a band around desired.
+        - If preset supports a manual/hold, switch to it first.
+        - If current mode is off/dry/fan_only, try switching to heat, else cool.
+        - Fallback to single temperature set.
+        """
+        try:
+            st = self.hass.states.get(eid)
+            if not st:
+                return False
+            attrs = st.attributes or {}
+            hvac_mode = str(attrs.get("hvac_mode", st.state)).lower()
+            hvac_modes = [str(x).lower() for x in (attrs.get("hvac_modes") or [])]
+            preset_mode = str(attrs.get("preset_mode", "") or "").lower()
+            preset_modes = [str(x).lower() for x in (attrs.get("preset_modes") or [])]
+            min_t = attrs.get("min_temp")
+            max_t = attrs.get("max_temp")
+
+            def _clamp(val: float) -> float:
+                try:
+                    if isinstance(min_t, (int, float)):
+                        val = max(val, float(min_t))
+                    if isinstance(max_t, (int, float)):
+                        val = min(val, float(max_t))
+                except Exception:
+                    pass
+                return val
+
+            # If preset has a manual/hold and not active, switch to it
+            try:
+                want_preset = None
+                for cand in ("manual", "hold"):
+                    if cand in preset_modes:
+                        want_preset = cand
+                        break
+                if want_preset and preset_mode != want_preset:
+                    await self.hass.services.async_call(
+                        "climate", "set_preset_mode", {"entity_id": eid, "preset_mode": want_preset}, blocking=False
+                    )
+            except Exception:
+                pass
+
+            # If in a mode that ignores temperature, try switching to a workable one
+            try:
+                if hvac_mode in ("off", "dry", "fan_only"):
+                    new_mode = None
+                    if "heat" in hvac_modes:
+                        new_mode = "heat"
+                    elif "cool" in hvac_modes:
+                        new_mode = "cool"
+                    if new_mode:
+                        await self.hass.services.async_call(
+                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode}, blocking=False
+                        )
+                        hvac_mode = new_mode
+            except Exception:
+                pass
+
+            # Decide whether to use range or single setpoint
+            has_low = isinstance(attrs.get("target_temp_low"), (int, float)) or ("target_temp_low" in attrs)
+            has_high = isinstance(attrs.get("target_temp_high"), (int, float)) or ("target_temp_high" in attrs)
+            use_range = (hvac_mode in ("heat_cool", "auto")) and has_low and has_high
+
+            if use_range:
+                # Build a narrow band around desired
+                band = 1.0
+                try:
+                    # Allow global override via settings.range_band_c
+                    _s, settings = self._get_data()
+                    band = float(settings.get("range_band_c", 1.0))
+                except Exception:
+                    pass
+                half = max(0.2, band / 2.0)
+                low = _clamp(desired - half)
+                high = _clamp(desired + half)
+                if high <= low:
+                    # Ensure valid ordering
+                    high = min(_clamp(low + 0.5), _clamp(desired + 0.5))
+                data = {"entity_id": eid, "target_temp_low": float(low), "target_temp_high": float(high)}
+                await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+                return True
+
+            # Fallback: single temperature
+            data = {"entity_id": eid, "temperature": float(_clamp(desired))}
+            await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+            return True
+        except Exception:
+            return False
 
 
 class BackupManager:
