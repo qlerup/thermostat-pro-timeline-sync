@@ -10,75 +10,82 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispat
 from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
-import json
-import os
-import threading
+import copy
 
-from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY, SIGNAL_DECISION
-from typing import Callable
+from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
 from homeassistant.helpers import entity_registry as er
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
-
-SERVICE_NAMES: tuple[str, ...] = (
-    "set_store",
-    "backup_now",
-    "restore_now",
-    "patch_entity",
-    "clear",
-    "early_start_set",
-)
 
 
 _LOGGER = logging.getLogger(__name__)
 
 
-async def _async_debug_write(hass: HomeAssistant, payload: dict) -> None:
-    """Persist debug payload outside the event loop via executor."""
-    base = hass.config.path(os.path.join("custom_components", DOMAIN))
-
-    def _write(base_path: str, body: dict) -> None:
-        os.makedirs(base_path, exist_ok=True)
-        path = os.path.join(base_path, "debug.log")
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(body, ensure_ascii=True) + "\n")
-
-    await hass.async_add_executor_job(_write, base, payload)
+def _empty_colors() -> dict:
+    return {"color_ranges": {}, "color_global": False}
 
 
-def _debug_log(hass: HomeAssistant, message: str, context: dict | None = None) -> None:
-    """Queue debug logging without blocking the Home Assistant event loop."""
-    try:
-        payload = {
-            "ts": dt_util.utcnow().isoformat(),
-            "msg": message,
-        }
-        if context is not None:
-            payload["ctx"] = context
+def _normalize_colors(payload) -> dict:
+    if not isinstance(payload, dict):
+        return _empty_colors()
+    color_ranges = payload.get("color_ranges")
+    if not isinstance(color_ranges, dict):
+        color_ranges = {}
+    return {
+        "color_ranges": color_ranges,
+        "color_global": bool(payload.get("color_global", False)),
+    }
 
-        async def _ensure_task() -> None:
-            try:
-                await _async_debug_write(hass, payload)
-            except Exception:
-                pass
 
-        hass.async_create_task(_ensure_task())
-    except RuntimeError:
-        # Loop not running (reload/startup). Write via background thread to avoid blocking.
-        def _fallback_write() -> None:
-            try:
-                base = hass.config.path(os.path.join("custom_components", DOMAIN))
-                os.makedirs(base, exist_ok=True)
-                path = os.path.join(base, "debug.log")
-                with open(path, "a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-            except Exception:
-                pass
+def _split_schedules(full: dict) -> tuple[dict, dict]:
+    main: dict = {}
+    weekday: dict = {}
+    if not isinstance(full, dict):
+        return main, weekday
+    for eid, row in full.items():
+        if not isinstance(row, dict):
+            continue
+        row_main = {}
+        row_week = {}
+        for key, value in row.items():
+            if key in ("weekly", "weekly_modes"):
+                if value is not None:
+                    row_week[key] = value
+            else:
+                row_main[key] = value
+        if row_main:
+            main[eid] = row_main
+        if row_week:
+            weekday[eid] = row_week
+    return main, weekday
 
-        threading.Thread(target=_fallback_write, name="thermostat_debug_log", daemon=True).start()
-    except Exception:
-        # Never let logging attempts take the system down
-        pass
+
+def _merge_schedules(main: dict, weekday: dict) -> dict:
+    merged = {}
+    if isinstance(main, dict):
+        for eid, row in main.items():
+            if isinstance(row, dict):
+                merged[eid] = copy.deepcopy(row)
+    if isinstance(weekday, dict):
+        for eid, row in weekday.items():
+            if not isinstance(row, dict):
+                continue
+            target = merged.setdefault(eid, {})
+            if "weekly" in row:
+                target["weekly"] = copy.deepcopy(row["weekly"])
+            if "weekly_modes" in row:
+                target["weekly_modes"] = copy.deepcopy(row["weekly_modes"])
+    return merged
+
+
+def _combine_settings(settings_base: dict, colors: dict) -> dict:
+    base = copy.deepcopy(settings_base or {})
+    col = colors or {}
+    if "color_ranges" in col:
+        base["color_ranges"] = copy.deepcopy(col["color_ranges"])
+    if "color_global" in col:
+        base["color_global"] = bool(col["color_global"])
+    return base
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # YAML fallback: hvis brugeren har 'thermostat_timeline:' i configuration.yaml
@@ -97,53 +104,59 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     backup_store = Store(hass, STORAGE_VERSION, f"{BACKUP_STORAGE_KEY}.json")
     backup_data = await backup_store.async_load() or {}
 
-    def _coerce_int(val):
-        try:
-            return int(round(float(val)))
-        except (TypeError, ValueError):
-            return val
-
-    def _harmonize_ml_settings(settings_dict):
-        if not isinstance(settings_dict, dict):
-            return {}
-        synced = dict(settings_dict)
-        pairs = (
-            ("early_start_enabled", "ml_enabled", lambda v: bool(v)),
-            ("early_start_training_interval_min", "ml_training_interval_min", _coerce_int),
-            ("early_start_min_cycles", "ml_min_samples", _coerce_int),
-            ("early_start_history_days", "ml_history_days", _coerce_int),
-            ("early_start_safety_margin_min", "ml_safety_margin_min", _coerce_int),
-            ("early_start_weather_entity", "ml_weather_entity", lambda v: str(v or "")),
-        )
-        for primary, mirror, caster in pairs:
-            has_primary = primary in synced
-            has_mirror = mirror in synced
-            if has_mirror and not has_primary:
-                try:
-                    synced[primary] = caster(synced[mirror])
-                except Exception:
-                    synced[primary] = synced[mirror]
-            elif has_primary and not has_mirror:
-                try:
-                    synced[mirror] = caster(synced[primary])
-                except Exception:
-                    synced[mirror] = synced[primary]
-        return synced
-
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
-    hass.data[DOMAIN]["schedules"] = data.get("schedules", {})
-    hass.data[DOMAIN]["settings"] = _harmonize_ml_settings(data.get("settings", {}))
-    hass.data[DOMAIN]["version"] = int(data.get("version", 1))
-    # ML (Early Start) persisted data (optional)
-    hass.data[DOMAIN]["ml"] = data.get("ml", {}) or {}
-    hass.data[DOMAIN]["ml_per_room"] = data.get("ml_per_room", {}) or {}
-    # Runtime status mirrors (not necessarily persisted)
-    hass.data[DOMAIN]["ml_status"] = data.get("ml_status")
-    hass.data[DOMAIN]["ml_enabled"] = data.get("ml_enabled")
-    hass.data[DOMAIN]["ml_trained_cycles"] = data.get("ml_trained_cycles")
-    hass.data[DOMAIN]["ml_confidence_pct"] = data.get("ml_confidence_pct")
-    hass.data[DOMAIN]["ml_last_trained_iso"] = data.get("ml_last_trained_iso")
+
+    raw_settings = copy.deepcopy(data.get("settings") or {})
+    raw_colors = data.get("colors")
+    if raw_colors is None and isinstance(raw_settings, dict):
+        extracted = {}
+        if "color_ranges" in raw_settings:
+            extracted["color_ranges"] = raw_settings.pop("color_ranges")
+        if "color_global" in raw_settings:
+            extracted["color_global"] = raw_settings.pop("color_global")
+        raw_colors = extracted
+    settings_section = raw_settings if isinstance(raw_settings, dict) else {}
+    colors_section = _normalize_colors(raw_colors)
+
+    raw_main = data.get("schedules_main")
+    raw_weekday = data.get("schedules_weekday")
+    if raw_main is None and raw_weekday is None:
+        old_sched = data.get("schedules", {})
+        raw_main, raw_weekday = _split_schedules(old_sched)
+
+    hass.data[DOMAIN]["settings_section"] = copy.deepcopy(settings_section)
+    hass.data[DOMAIN]["colors_section"] = colors_section
+    hass.data[DOMAIN]["schedules_main"] = copy.deepcopy(raw_main or {})
+    hass.data[DOMAIN]["schedules_weekday"] = copy.deepcopy(raw_weekday or {})
+    hass.data[DOMAIN]["schedules"] = _merge_schedules(
+        hass.data[DOMAIN]["schedules_main"],
+        hass.data[DOMAIN]["schedules_weekday"],
+    )
+    hass.data[DOMAIN]["settings"] = _combine_settings(
+        hass.data[DOMAIN]["settings_section"],
+        hass.data[DOMAIN]["colors_section"],
+    )
+
+    versions_raw = data.get("versions") or {}
+    base_version = int(data.get("version", 1)) or 1
+
+    def _init_version(key: str) -> int:
+        try:
+            value = int(versions_raw.get(key))
+            if value > 0:
+                return value
+        except Exception:
+            pass
+        return base_version
+
+    hass.data[DOMAIN]["versions"] = {
+        "settings": _init_version("settings"),
+        "colors": _init_version("colors"),
+        "schedules_main": _init_version("schedules_main"),
+        "schedules_weekday": _init_version("schedules_weekday"),
+    }
+    hass.data[DOMAIN]["version"] = max(hass.data[DOMAIN]["versions"].values())
     # Backup payloads
     hass.data[DOMAIN]["backup_schedules"] = backup_data.get("schedules", {})
     hass.data[DOMAIN]["backup_settings"] = backup_data.get("settings", {})
@@ -153,43 +166,39 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["backup_partial_flags"] = backup_data.get("partial_flags")
 
     async def _save_and_broadcast():
-        _debug_log(hass, "save_and_broadcast:start", {"version": hass.data[DOMAIN].get("version")})
         # Broadcast first so UI updates immediately
-        try:
-            async_dispatcher_send(hass, SIGNAL_UPDATED)
-            _debug_log(hass, "save_and_broadcast:dispatch_ok", None)
-        except Exception as err:
-            _debug_log(hass, "save_and_broadcast:dispatch_failed", {"error": repr(err)})
-            raise
-        # Proactively nudge the overview sensor to update its state in HA
+        async_dispatcher_send(hass, SIGNAL_UPDATED)
+        # Proactively nudge individual sensors to refresh immediately
         try:
             ent_reg = er.async_get(hass)
-            sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
-            if sensor_eid:
-                _debug_log(hass, "save_and_broadcast:update_entity", {"entity_id": sensor_eid})
-                await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
-                _debug_log(hass, "save_and_broadcast:update_dispatched", {"entity_id": sensor_eid})
+            for uid in (
+                "thermostat_timeline_settings",
+                "thermostat_timeline_colors",
+                "thermostat_timeline_schedules",
+                "thermostat_timeline_weekdays",
+            ):
+                sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, uid)
+                if sensor_eid:
+                    await hass.services.async_call(
+                        "homeassistant",
+                        "update_entity",
+                        {"entity_id": sensor_eid},
+                        blocking=False,
+                    )
         except Exception:
             pass
         try:
             await store.async_save({
-                "schedules": hass.data[DOMAIN]["schedules"],
-                "settings": hass.data[DOMAIN].get("settings", {}),
+                "schedules_main": hass.data[DOMAIN].get("schedules_main", {}),
+                "schedules_weekday": hass.data[DOMAIN].get("schedules_weekday", {}),
+                "settings": hass.data[DOMAIN].get("settings_section", {}),
+                "colors": hass.data[DOMAIN].get("colors_section", _empty_colors()),
+                "versions": hass.data[DOMAIN].get("versions", {}),
                 "version": hass.data[DOMAIN]["version"],
-                # Persist ML related data
-                "ml": hass.data[DOMAIN].get("ml", {}),
-                "ml_per_room": hass.data[DOMAIN].get("ml_per_room", {}),
-                "ml_status": hass.data[DOMAIN].get("ml_status"),
-                "ml_enabled": hass.data[DOMAIN].get("ml_enabled"),
-                "ml_trained_cycles": hass.data[DOMAIN].get("ml_trained_cycles"),
-                "ml_confidence_pct": hass.data[DOMAIN].get("ml_confidence_pct"),
-                "ml_last_trained_iso": hass.data[DOMAIN].get("ml_last_trained_iso"),
             })
-            _debug_log(hass, "save_and_broadcast:store_saved", None)
-        except Exception as err:
+        except Exception:
             # Storage failure shouldn't block UI update
             _LOGGER.warning("%s: failed to save store after broadcast", DOMAIN)
-            _debug_log(hass, "save_and_broadcast:store_failed", {"error": repr(err)})
 
     async def _save_backup():
         # Broadcast so backup sensor updates
@@ -213,82 +222,123 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             _LOGGER.warning("%s: failed to save backup store", DOMAIN)
 
-    async def set_store(call: ServiceCall):
+    def _bump(section: str):
+        versions = hass.data[DOMAIN].setdefault("versions", {})
         try:
-            await _set_store_internal(call)
-        except Exception as err:
-            _debug_log(hass, "set_store:exception", {"error": repr(err)})
-            raise
+            versions[section] = int(versions.get(section, 1)) + 1
+        except Exception:
+            versions[section] = 1
 
-    async def _set_store_internal(call: ServiceCall):
+    def _update_combined_settings():
+        hass.data[DOMAIN]["settings"] = _combine_settings(
+            hass.data[DOMAIN].get("settings_section", {}),
+            hass.data[DOMAIN].get("colors_section", _empty_colors()),
+        )
+
+    def _set_settings_base(new_base: dict | None) -> bool:
+        cur = hass.data[DOMAIN].get("settings_section", {}) or {}
+        incoming = copy.deepcopy(new_base or {})
+        if incoming == cur:
+            return False
+        hass.data[DOMAIN]["settings_section"] = incoming
+        _update_combined_settings()
+        _bump("settings")
+        return True
+
+    def _set_colors_section(new_colors: dict | None) -> bool:
+        incoming = _normalize_colors(new_colors)
+        cur = hass.data[DOMAIN].get("colors_section") or _empty_colors()
+        if incoming == cur:
+            return False
+        hass.data[DOMAIN]["colors_section"] = incoming
+        _update_combined_settings()
+        _bump("colors")
+        return True
+
+    def _set_schedule_sections(main: dict | None, weekday: dict | None) -> set[str]:
+        changed: set[str] = set()
+        if main is not None:
+            incoming = copy.deepcopy(main)
+            if incoming != hass.data[DOMAIN].get("schedules_main", {}):
+                hass.data[DOMAIN]["schedules_main"] = incoming
+                changed.add("schedules_main")
+        if weekday is not None:
+            incoming = copy.deepcopy(weekday)
+            if incoming != hass.data[DOMAIN].get("schedules_weekday", {}):
+                hass.data[DOMAIN]["schedules_weekday"] = incoming
+                changed.add("schedules_weekday")
+        if changed:
+            hass.data[DOMAIN]["schedules"] = _merge_schedules(
+                hass.data[DOMAIN].get("schedules_main", {}),
+                hass.data[DOMAIN].get("schedules_weekday", {}),
+            )
+            for sec in changed:
+                _bump(sec)
+        return changed
+
+    def _set_full_schedules(full: dict | None) -> bool:
+        main, weekday = _split_schedules(full or {})
+        changed = _set_schedule_sections(main, weekday)
+        return bool(changed)
+
+    async def set_store(call: ServiceCall):
         force = bool(call.data.get("force"))
-        cur_sched = hass.data[DOMAIN].get("schedules", {})
-        cur_set = hass.data[DOMAIN].get("settings", {}) or {}
-        cur_set_norm = _harmonize_ml_settings(cur_set)
         changed = False
-        try:
-            sched_payload = call.data.get("schedules")
-            settings_payload = call.data.get("settings")
-            ctx = {
-                "force": force,
-                "sched_rooms": len(sched_payload or {}) if isinstance(sched_payload, dict) else 0,
-                "settings_keys": sorted((settings_payload or {}).keys())[:25]
-            }
-            _debug_log(hass, "set_store:start", ctx)
-        except Exception:
-            pass
-        # Debug: record last received settings payload (for troubleshooting)
-        try:
-            if "settings" in call.data and isinstance(call.data.get("settings"), dict):
-                preview = _harmonize_ml_settings(call.data.get("settings"))
-                hass.data[DOMAIN]["debug_last_settings"] = {
-                    "ts": dt_util.utcnow().isoformat(),
-                    "payload": preview
-                }
-                # Track a short history of early_start_enabled values to diagnose overwrite
-                try:
-                    hist = hass.data[DOMAIN].get("debug_settings_history") or []
-                    es_val = preview.get("early_start_enabled")
-                    hist.append({
-                        "ts": hass.data[DOMAIN]["debug_last_settings"]["ts"],
-                        "early_start_enabled": es_val
-                    })
-                    hass.data[DOMAIN]["debug_settings_history"] = hist[-20:]
-                except Exception:
-                    pass
-        except Exception:
-            pass
+
         if "schedules" in call.data:
             schedules = call.data.get("schedules")
             if not isinstance(schedules, dict):
                 _LOGGER.warning("%s.set_store: schedules must be an object when provided", DOMAIN)
                 return
-            if schedules != cur_sched:
-                hass.data[DOMAIN]["schedules"] = schedules
-                changed = True
-        # Optional settings payload (merge keys instead of full replace)
-        if "settings" in call.data:
-            incoming = call.data.get("settings")
-            if isinstance(incoming, dict):
-                incoming = _harmonize_ml_settings(incoming)
-                merged = dict(cur_set_norm)
-                for k, v in incoming.items():
-                    merged[k] = v
-                merged = _harmonize_ml_settings(merged)
-                if merged != cur_set_norm:
-                    hass.data[DOMAIN]["settings"] = merged
-                    changed = True
+            changed |= _set_full_schedules(schedules)
+        else:
+            if "schedules_main" in call.data:
+                main_section = call.data.get("schedules_main")
+                if not isinstance(main_section, dict):
+                    _LOGGER.warning("%s.set_store: schedules_main must be an object when provided", DOMAIN)
+                    return
+                changed |= bool(_set_schedule_sections(main_section, None))
+            if "schedules_weekday" in call.data:
+                week_section = call.data.get("schedules_weekday")
+                if not isinstance(week_section, dict):
+                    _LOGGER.warning("%s.set_store: schedules_weekday must be an object when provided", DOMAIN)
+                    return
+                changed |= bool(_set_schedule_sections(None, week_section))
+
+        colors_payload = call.data.get("colors") if isinstance(call.data.get("colors"), dict) else None
+        settings_payload = call.data.get("settings") if isinstance(call.data.get("settings"), dict) else None
+
+        if settings_payload is not None:
+            settings_copy = copy.deepcopy(settings_payload)
+            extracted_colors = {}
+            if "color_ranges" in settings_copy:
+                extracted_colors["color_ranges"] = settings_copy.pop("color_ranges")
+            if "color_global" in settings_copy:
+                extracted_colors["color_global"] = settings_copy.pop("color_global")
+            if extracted_colors:
+                if colors_payload:
+                    merged_colors = dict(colors_payload)
+                    merged_colors.update(extracted_colors)
+                    colors_payload = merged_colors
+                else:
+                    colors_payload = extracted_colors
+            # DEBUG: Log all received settings
+            try:
+                import json
+                _LOGGER.warning("[TT DEBUG] set_store received settings: %s", json.dumps(settings_copy, ensure_ascii=False))
+            except Exception as e:
+                _LOGGER.warning("[TT DEBUG] set_store logging error: %s", str(e))
+            changed |= _set_settings_base(settings_copy)
+
+        if colors_payload is not None:
+            changed |= _set_colors_section(colors_payload)
+
         if not changed and not force:
             # No-op: nothing changed and not forced; avoid spurious version bump/apply
-            _debug_log(hass, "set_store:noop", {"version": hass.data[DOMAIN].get("version")})
             return
-        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
-        try:
-            await _save_and_broadcast()
-            _debug_log(hass, "set_store:save_ok", {"version": hass.data[DOMAIN]["version"]})
-        except Exception as err:
-            _debug_log(hass, "set_store:save_failed", {"error": repr(err)})
-            raise
+
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+        await _save_and_broadcast()
 
     async def backup_now(call: ServiceCall):
         """Create a backup of the current store.
@@ -408,19 +458,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # If no flags and mode empty, keep legacy behavior (replace)
         if not flags and mode not in ("merge", "replace"):
-            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
-            hass.data[DOMAIN]["settings"] = _harmonize_ml_settings(dict(backup_set))
-            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
-            await _save_and_broadcast()
+            await set_store(ServiceCall(DOMAIN, "set_store", {
+                "schedules": copy.deepcopy(backup_sched),
+                "settings": copy.deepcopy(backup_set),
+                "force": True,
+            }))
             return
 
         do_merge = (mode == "merge") or (not mode and bool(flags))
         if not do_merge:
-            # Explicit replace
-            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
-            hass.data[DOMAIN]["settings"] = _harmonize_ml_settings(dict(backup_set))
-            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
-            await _save_and_broadcast()
+            await set_store(ServiceCall(DOMAIN, "set_store", {
+                "schedules": copy.deepcopy(backup_sched),
+                "settings": copy.deepcopy(backup_set),
+                "force": True,
+            }))
             return
 
         # Merge: only update selected sections/keys
@@ -468,10 +519,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     continue
                 cur_set[k] = v
 
-        hass.data[DOMAIN]["schedules"] = cur_sched
-        hass.data[DOMAIN]["settings"] = _harmonize_ml_settings(cur_set)
-        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
-        await _save_and_broadcast()
+        await set_store(ServiceCall(DOMAIN, "set_store", {
+            "schedules": cur_sched,
+            "settings": cur_set,
+            "force": True,
+        }))
 
     async def patch_entity(call: ServiceCall):
         eid = str(call.data.get("entity_id","")).strip()
@@ -479,47 +531,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not eid or not isinstance(d, dict):
             _LOGGER.warning("%s.patch_entity: invalid args", DOMAIN)
             return
-        cur = dict(hass.data[DOMAIN]["schedules"].get(eid, {}))
-        if "defaultTemp" in d: cur["defaultTemp"] = d["defaultTemp"]
-        if "blocks" in d and isinstance(d["blocks"], list): cur["blocks"] = d["blocks"]
-        hass.data[DOMAIN]["schedules"][eid] = cur
-        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
-        await _save_and_broadcast()
+        all_sched = copy.deepcopy(hass.data[DOMAIN].get("schedules", {}) or {})
+        cur = dict(all_sched.get(eid, {}))
+        if "defaultTemp" in d:
+            cur["defaultTemp"] = d["defaultTemp"]
+        if "blocks" in d and isinstance(d["blocks"], list):
+            cur["blocks"] = d["blocks"]
+        all_sched[eid] = cur
+        await set_store(ServiceCall(DOMAIN, "set_store", {"schedules": all_sched, "force": True}))
 
     async def clear(call: ServiceCall):
-        hass.data[DOMAIN]["schedules"] = {}
-        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
-        await _save_and_broadcast()
+        await set_store(ServiceCall(DOMAIN, "set_store", {"schedules": {}, "force": True}))
 
     hass.services.async_register(DOMAIN, "set_store", set_store)
     hass.services.async_register(DOMAIN, "backup_now", backup_now)
     hass.services.async_register(DOMAIN, "restore_now", restore_now)
     hass.services.async_register(DOMAIN, "patch_entity", patch_entity)
     hass.services.async_register(DOMAIN, "clear", clear)
-    
-    async def early_start_set(call: ServiceCall):
-        """Explicitly enable/disable Early Start (ML) regardless of editor behavior."""
-        try:
-            enabled = bool(call.data.get("enabled"))
-            settings = hass.data[DOMAIN].get("settings", {})
-            current_es = bool(settings.get("early_start_enabled"))
-            current_ml = bool(settings.get("ml_enabled")) if "ml_enabled" in settings else current_es
-            if current_es != enabled or current_ml != enabled:
-                settings["early_start_enabled"] = enabled
-                settings["ml_enabled"] = enabled
-                hass.data[DOMAIN]["settings"] = _harmonize_ml_settings(settings)
-                hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
-                # Record in debug history
-                try:
-                    hist = hass.data[DOMAIN].get("debug_settings_history") or []
-                    hist.append({"ts": dt_util.utcnow().isoformat(), "early_start_enabled": enabled, "source": "service"})
-                    hass.data[DOMAIN]["debug_settings_history"] = hist[-20:]
-                except Exception:
-                    pass
-                await _save_and_broadcast()
-        except Exception:
-            _LOGGER.warning("%s.early_start_set: failed", DOMAIN)
-    hass.services.async_register(DOMAIN, "early_start_set", early_start_set)
     # no apply_now service (removed)
 
     await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
@@ -532,36 +560,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     bkm = BackupManager(hass, backup_cb=backup_now)
     hass.data[DOMAIN]["backup_manager"] = bkm
     await bkm.async_start()
-    # ---- Early Start (ML) Manager ----
-    esm = EarlyStartManager(hass, save_cb=_save_and_broadcast)
-    hass.data[DOMAIN]["earlystart_manager"] = esm
-    await esm.async_start()
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    data = hass.data.get(DOMAIN, {})
-    mgr: AutoApplyManager | None = data.get("manager")
-    bkm: BackupManager | None = data.get("backup_manager")
-    esm: EarlyStartManager | None = data.get("earlystart_manager")
-
-    for worker in (mgr, bkm, esm):
-        if worker is None:
-            continue
-        stop = getattr(worker, "async_stop", None)
-        if stop is not None:
-            try:
-                await stop()
-            except Exception:
-                _LOGGER.debug("%s: failed to stop %s during unload", DOMAIN, worker.__class__.__name__)
-
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, ["sensor"])
-
-    for service in SERVICE_NAMES:
-        if hass.services.has_service(DOMAIN, service):
-            hass.services.async_remove(DOMAIN, service)
-
-    hass.data.pop(DOMAIN, None)
-    return unload_ok
+    return await hass.config_entries.async_unload_platforms(entry, ["sensor"])
 
 
 class AutoApplyManager:
@@ -569,7 +571,6 @@ class AutoApplyManager:
         self.hass = hass
         self._unsub_timer = None
         self._unsub_persons = None
-        self._unsub_store = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
         self._next_is_resume = False
 
@@ -581,20 +582,9 @@ class AutoApplyManager:
         @callback
         def _on_store_update():
             self.hass.async_create_task(self._on_store_changed())
-        self._unsub_store = async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_store_update)
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_store_update)
         # Watch person.* states if away mode is used
         self._reset_person_watch()
-
-    async def async_stop(self):
-        if self._unsub_timer:
-            self._unsub_timer()
-            self._unsub_timer = None
-        if self._unsub_persons:
-            self._unsub_persons()
-            self._unsub_persons = None
-        if self._unsub_store:
-            self._unsub_store()
-            self._unsub_store = None
 
     async def _on_store_changed(self):
         # Respect apply_on_edit toggle: only apply immediately on store changes when enabled
@@ -649,34 +639,6 @@ class AutoApplyManager:
         idx = (dt_util.now().weekday())  # 0..6
         return ["mon","tue","wed","thu","fri","sat","sun"][idx]
 
-    def _is_holiday_today(self, settings: dict) -> bool:
-        """Return True if today is a holiday according to settings.
-
-        Supports two sources:
-          - calendar: an entity (binary/calendar/simple) that is 'on' on holidays
-          - manual: list of ISO dates (YYYY-MM-DD) in settings.holidays_dates
-        """
-        try:
-            if not bool(settings.get("holidays_enabled")):
-                return False
-            source = str(settings.get("holidays_source", "")).strip().lower()
-            if source == "calendar":
-                eid = settings.get("holidays_entity")
-                if isinstance(eid, str) and eid:
-                    st = self.hass.states.get(eid)
-                    if st and str(st.state).lower() in ("on", "true", "holiday"):
-                        return True
-                return False
-            if source == "manual":
-                dates = settings.get("holidays_dates") or []
-                if isinstance(dates, list) and dates:
-                    today_iso = dt_util.now().date().isoformat()
-                    return today_iso in dates
-                return False
-        except Exception:
-            return False
-        return False
-
     def _effective_blocks_today(self, row: dict, settings: dict):
         # Presence (advanced away) overrides if enabled and an active combo exists
         try:
@@ -707,15 +669,6 @@ class AutoApplyManager:
                     blk = (profs.get(ap) or {}).get("blocks")
                     if isinstance(blk, list):
                         return blk
-        except Exception:
-            pass
-        # Holiday schedule override (after presence & profiles, before weekly/default)
-        try:
-            if self._is_holiday_today(settings):
-                h = row.get("holiday") or {}
-                hb = h.get("blocks") if isinstance(h, dict) else None
-                if isinstance(hb, list) and len(hb) > 0:
-                    return hb
         except Exception:
             pass
         # If row has weekly structure, use today's day list, otherwise default blocks
@@ -986,27 +939,8 @@ class AutoApplyManager:
         self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
 
     async def _timer_fire(self):
-        # If this wake was caused by pause expiry, apply immediately across all entities
-        boundary_only = (not self._next_is_resume)
-        # Before applying, compute which primaries are at boundary now for signaling
-        at_primaries = []
-        try:
-            schedules, settings = self._get_data()
-            now_min = self._now_min()
-            for primary, row in (schedules.items() if isinstance(schedules, dict) else []):
-                try:
-                    if self._entity_has_boundary_now(row, now_min):
-                        at_primaries.append(primary)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        await self._maybe_apply_now(force=True, boundary_only=boundary_only)
-        # Emit decision signal so EarlyStartManager can start measurement at same trigger
-        try:
-            async_dispatcher_send(self.hass, SIGNAL_DECISION, {"type": "boundary", "primaries": at_primaries})
-        except Exception:
-            pass
+        # Kun auto-apply ved block boundary (timeren)
+        await self._maybe_apply_now(force=True, boundary_only=True)
         self._next_is_resume = False
         await self._schedule_next()
 
@@ -1021,8 +955,7 @@ class AutoApplyManager:
         if (away.get("enabled") or away.get("advanced_enabled")) and isinstance(persons, list) and persons:
             @callback
             def _ch(event):
-                # Apply immediately when presence changes
-                self.hass.async_create_task(self._maybe_apply_now(force=True))
+                # Kun schedule next, ingen auto-apply
                 self.hass.async_create_task(self._schedule_next())
             self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
 
@@ -1145,778 +1078,11 @@ class AutoApplyManager:
             return False
 
 
-class EarlyStartManager:
-    """Collects heating cycle samples and computes simple preheat predictions.
-
-    This manager runs in the background and does NOT send setpoints; it only
-    observes climate state, ambient/target temps and updates ML attributes.
-    """
-    def __init__(self, hass: HomeAssistant, save_cb):
-        self.hass = hass
-        self._save_cb = save_cb
-        self._unsub_sample = None
-        self._unsub_retrain = None
-        self._unsub_call = None
-        self._unsub_persons = None
-        self._unsub_store = None
-        self._unsub_decision = None
-        self._preheat_timers: dict[str, Callable[[], None]] = {}
-        self._active: dict[str, dict] = {}  # primary -> {start, target_c, ambient_start_c, outside_start_c, samples: [(iso, c)]}
-        self._away_active_prev: bool | None = None
-        self._handling_store_signal = False  # prevents recursive SIGNAL_UPDATED storms
-        # Debug fields (transient, not persisted): last begin attempt & last cancel
-        d = self.hass.data.setdefault(DOMAIN, {})
-        d.setdefault("ml_debug_last_begin_attempt", None)
-        d.setdefault("ml_debug_last_cancel_reason", None)
-
-    def _data(self):
-        d = self.hass.data.get(DOMAIN, {})
-        schedules = d.get("schedules", {}) or {}
-        settings = d.get("settings", {}) or {}
-        ml = d.get("ml", {}) or {}
-        ml_per_room = d.get("ml_per_room", {}) or {}
-        return schedules, settings, ml, ml_per_room
-
-    def _settings(self):
-        return (self.hass.data.get(DOMAIN, {}) or {}).get("settings", {}) or {}
-
-    def _merges(self):
-        s = self._settings(); return (s.get("merges") or {}) if isinstance(s.get("merges"), dict) else {}
-
-    def _temp_sensors(self):
-        s = self._settings(); return (s.get("temp_sensors") or {}) if isinstance(s.get("temp_sensors"), dict) else {}
-
-    def _min_samples(self) -> int:
-        try: return max(1, int(self._settings().get("early_start_min_cycles", 10)))
-        except Exception: return 10
-
-    def _hist_days(self) -> int:
-        try: return max(1, int(self._settings().get("early_start_history_days", 90)))
-        except Exception: return 90
-
-    def _enabled(self) -> bool:
-        try: return bool(self._settings().get("early_start_enabled", False))
-        except Exception: return False
-
-    def _weather_eid(self) -> str | None:
-        try:
-            v = str(self._settings().get("early_start_weather_entity") or "").strip()
-            return v or None
-        except Exception:
-            return None
-
-    def _away_cfg(self) -> dict:
-        try:
-            s = self._settings()
-            return (s.get("away") or {}) if isinstance(s.get("away"), dict) else {}
-        except Exception:
-            return {}
-
-    def _away_persons(self) -> list[str]:
-        try:
-            a = self._away_cfg()
-            ppl = a.get("persons")
-            return [str(x) for x in (ppl or [])] if isinstance(ppl, list) else []
-        except Exception:
-            return []
-
-    def _adv_presence_active(self) -> bool:
-        """Return True if advanced presence combo is currently active globally."""
-        try:
-            a = self._away_cfg()
-            if not bool(a.get("advanced_enabled")):
-                return False
-            persons = self._away_persons()
-            if not persons:
-                return False
-            home, not_home = [], []
-            for p in persons:
-                st = self.hass.states.get(p)
-                if st and str(st.state).lower() == "home":
-                    home.append(p)
-                else:
-                    not_home.append(p)
-            key = self._presence_combo_key(home, not_home)
-            combos = (a.get("combos") or {}) if isinstance(a, dict) else {}
-            meta = combos.get(key)
-            return bool(meta and meta.get("enabled"))
-        except Exception:
-            return False
-
-    def _simple_away_active(self) -> bool:
-        try:
-            a = self._away_cfg()
-            if not bool(a.get("enabled")):
-                return False
-            persons = self._away_persons()
-            if not persons:
-                return False
-            # active when none are home
-            for p in persons:
-                st = self.hass.states.get(p)
-                if st and str(st.state).lower() == "home":
-                    return False
-            return True
-        except Exception:
-            return False
-
-    def _away_active(self) -> bool:
-        # Advanced presence takes precedence
-        if self._adv_presence_active():
-            return True
-        return self._simple_away_active()
-
-    def _presence_combo_key(self, home: list[str], away: list[str]) -> str:
-        try:
-            h = sorted([str(x) for x in (home or [])])
-            a = sorted([str(x) for x in (away or [])])
-            return f"H:{','.join(h)}|A:{','.join(a)}"
-        except Exception:
-            return "H:|A:"
-
-    def _now_iso(self) -> str:
-        try: return dt_util.utcnow().isoformat()
-        except Exception: return ""
-
-    def _ha_is_f(self) -> bool:
-        try:
-            u = str(self.hass.config.units.temperature or "")
-            return u.upper().find("F") >= 0
-        except Exception:
-            return False
-
-    def _to_c(self, v: float) -> float:
-        try:
-            return (v - 32.0) * 5.0 / 9.0 if self._ha_is_f() else v
-        except Exception:
-            return v
-
-    def _ambient_for_entity_c(self, eid: str) -> float | None:
-        # Prefer temp_sensors mapping, else climate.current_temperature
-        try:
-            st = self.hass.states.get(eid)
-            if not st:
-                return None
-            # If mapped sensor exists for primary EID, use it (handled by caller for primary only)
-            v = st.attributes.get("current_temperature")
-            if isinstance(v, (int, float)):
-                return float(self._to_c(float(v)))
-        except Exception:
-            pass
-        return None
-
-    def _room_ambient_c(self, primary: str) -> float | None:
-        vals = []
-        # Sensor override on primary
-        try:
-            sensors = self._temp_sensors(); sid = sensors.get(primary)
-            if sid:
-                st = self.hass.states.get(sid)
-                if st:
-                    try:
-                        vv = float(st.state)
-                        vals.append(self._to_c(vv))
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        merges = self._merges(); group = [primary] + list(merges.get(primary) or [])
-        for eid in group:
-            c = self._ambient_for_entity_c(eid)
-            if isinstance(c, (int, float)):
-                vals.append(float(c))
-        if not vals:
-            return None
-        return sum(vals) / len(vals)
-
-    def _room_target_c(self, primary: str) -> float | None:
-        st = self.hass.states.get(primary)
-        if st:
-            a = st.attributes or {}
-            for k in ("temperature", "target_temperature", "target_temp"):
-                v = a.get(k)
-                if isinstance(v, (int, float)):
-                    return float(self._to_c(float(v)))
-            # heat_cool band -> use high
-            vh = a.get("target_temp_high"); vl = a.get("target_temp_low")
-            if isinstance(vh, (int, float)):
-                return float(self._to_c(float(vh)))
-            if isinstance(vl, (int, float)):
-                return float(self._to_c(float(vl)))
-        # Fallback: schedule desired now
-        try:
-            schedules, settings, _ml, _mlpr = self._data()
-            aam = AutoApplyManager(self.hass)  # temporary helper usage
-            # Inject data into helper instance
-            def _get_data_override():
-                return schedules, settings
-            aam._get_data = _get_data_override  # type: ignore
-            now_min = int(dt_util.now().hour) * 60 + int(dt_util.now().minute)
-            return float(aam._desired_for(primary, schedules, settings, now_min))
-        except Exception:
-            return None
-
-    def _outside_now_c(self) -> float | None:
-        eid = self._weather_eid()
-        if not eid:
-            return None
-        st = self.hass.states.get(eid)
-        if not st:
-            return None
-        # Prefer state if numeric; else attributes.temperature
-        try:
-            v = float(st.state)
-            return self._to_c(v)
-        except Exception:
-            pass
-        try:
-            v = st.attributes.get("temperature")
-            if isinstance(v, (int, float)):
-                return self._to_c(float(v))
-        except Exception:
-            pass
-        return None
-
-    async def async_start(self):
-        # Schedule sampling and retraining if enabled; also react to store updates
-        @callback
-        def _on_update():
-            self.hass.async_create_task(self._on_store_changed())
-        self._unsub_store = async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
-        # Listen to decision points from AutoApplyManager (boundary hits)
-        @callback
-        def _on_decision(payload):
-            try:
-                if not self._enabled():
-                    return
-                if not isinstance(payload, dict):
-                    return
-                primaries = payload.get("primaries") or []
-                for p in primaries:
-                    self.hass.async_create_task(self._begin_session(str(p), target_override=None))
-            except Exception:
-                return
-            self._unsub_decision = async_dispatcher_connect(self.hass, SIGNAL_DECISION, _on_decision)
-        await self._on_store_changed()
-        # Listen for climate.set_temperature service calls (from card OR integration)
-        @callback
-        def _on_call(event):
-            try:
-                data = event.data or {}
-                if data.get("domain") != "climate" or data.get("service") != "set_temperature":
-                    return
-                svcdata = data.get("service_data") or {}
-                eids = svcdata.get("entity_id")
-                if isinstance(eids, str):
-                    eids = [eids]
-                if not isinstance(eids, list):
-                    return
-                # Resolve target temperature from payload
-                target = None
-                for k in ("temperature", "target_temperature"):
-                    v = svcdata.get(k)
-                    if isinstance(v, (int, float)):
-                        target = float(self._to_c(float(v)))
-                        break
-                if target is None:
-                    # Range mode: use high side for heating
-                    vh = svcdata.get("target_temp_high"); vl = svcdata.get("target_temp_low")
-                    if isinstance(vh, (int, float)):
-                        target = float(self._to_c(float(vh)))
-                    elif isinstance(vl, (int, float)):
-                        target = float(self._to_c(float(vl)))
-                for eid in eids:
-                    try:
-                        pe = self._primary_of(eid)
-                        if not pe:
-                            continue
-                        self.hass.async_create_task(self._begin_session(pe, target))
-                    except Exception:
-                        continue
-            except Exception:
-                return
-        if self._unsub_call:
-            self._unsub_call()
-        self._unsub_call = self.hass.bus.async_listen("call_service", _on_call)
-        # Watch person states to cancel ongoing ML sessions when away becomes active
-        await self._reset_person_watch()
-
-    async def async_stop(self):
-        if self._unsub_store:
-            self._unsub_store()
-            self._unsub_store = None
-        if self._unsub_decision:
-            self._unsub_decision()
-            self._unsub_decision = None
-        if self._unsub_call:
-            self._unsub_call()
-            self._unsub_call = None
-        if self._unsub_persons:
-            self._unsub_persons()
-            self._unsub_persons = None
-        if self._unsub_sample:
-            self._unsub_sample()
-            self._unsub_sample = None
-        if self._unsub_retrain:
-            self._unsub_retrain()
-            self._unsub_retrain = None
-        for unsub in list(self._preheat_timers.values()):
-            try:
-                unsub()
-            except Exception:
-                pass
-        self._preheat_timers.clear()
-        await self._cancel_all_sessions()
-
-    async def _on_store_changed(self):
-        if self._handling_store_signal:
-            return
-        self._handling_store_signal = True
-        try:
-            # Refresh enablement and timers
-            await self._ensure_timers()
-            await self._ensure_preheat_schedules()
-            # Update top-level flags for sensor consumption
-            d = self.hass.data[DOMAIN]
-            d["ml_enabled"] = bool(self._enabled())
-            if d.get("ml_status") is None:
-                d["ml_status"] = "disabled"
-            async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-            # Rewire person watchers when settings change
-            await self._reset_person_watch()
-        finally:
-            self._handling_store_signal = False
-
-    async def _ensure_timers(self):
-        # Sampling timer (every 2 minutes)
-        if self._unsub_sample:
-            self._unsub_sample(); self._unsub_sample = None
-        if not self._enabled():
-            return
-        @callback
-        def _sample_cb(_now):
-            self.hass.async_create_task(self._do_sample())
-            # reschedule in 2 minutes
-            next_dt = dt_util.utcnow() + timedelta(minutes=2)
-            self._unsub_sample = async_track_point_in_utc_time(self.hass, _sample_cb, next_dt)
-        first = dt_util.utcnow() + timedelta(minutes=2)
-        self._unsub_sample = async_track_point_in_utc_time(self.hass, _sample_cb, first)
-        # Retraining timer
-        if self._unsub_retrain:
-            self._unsub_retrain(); self._unsub_retrain = None
-        try:
-            mins = max(5, int(self._settings().get("early_start_training_interval_min", 30)))
-        except Exception:
-            mins = 30
-        @callback
-        def _retrain_cb(_now):
-            self.hass.async_create_task(self._retrain())
-            next_dt = dt_util.utcnow() + timedelta(minutes=mins)
-            self._unsub_retrain = async_track_point_in_utc_time(self.hass, _retrain_cb, next_dt)
-        first_r = dt_util.utcnow() + timedelta(minutes=mins)
-        self._unsub_retrain = async_track_point_in_utc_time(self.hass, _retrain_cb, first_r)
-
-    async def _reset_person_watch(self):
-        # Subscribe to person.* listed in away config
-        if self._unsub_persons:
-            self._unsub_persons(); self._unsub_persons = None
-        persons = self._away_persons()
-        if not persons:
-            self._away_active_prev = None
-            return
-        self._away_active_prev = self._away_active()
-        @callback
-        def _ch(event):
-            now_active = self._away_active()
-            prev = self._away_active_prev
-            self._away_active_prev = now_active
-            # If away just became active, cancel all ongoing sessions
-            if now_active and (prev is False or prev is None):
-                self.hass.async_create_task(self._cancel_all_sessions())
-        self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
-
-    async def _cancel_all_sessions(self):
-        for primary in list(self._active.keys()):
-            try:
-                await self._cancel_session(primary)
-            except Exception:
-                continue
-
-    async def _cancel_session(self, primary: str):
-        # Remove without recording to history
-        self._active.pop(primary, None)
-        # Keep status as-is; we don't broadcast every cancel, to reduce churn
-        try:
-            d = self.hass.data[DOMAIN]
-            d["ml_debug_last_cancel_reason"] = {
-                "ts": self._now_iso(),
-                "primary": primary,
-                "reason": "cancel",
-                "active_remaining": list(self._active.keys()),
-            }
-            async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-        except Exception:
-            pass
-
-    async def _ensure_preheat_schedules(self):
-        # Clear existing preheat timers
-        for k, unsub in list(self._preheat_timers.items()):
-            try:
-                unsub()
-            except Exception:
-                pass
-            self._preheat_timers.pop(k, None)
-        if not self._enabled():
-            return
-        d = self.hass.data[DOMAIN]
-        mlpr = d.get("ml_per_room") or {}
-        min_needed = self._min_samples()
-        try:
-            safety = float(self._settings().get("early_start_safety_margin_min", 5))
-        except Exception:
-            safety = 5.0
-        # For each primary with enough data, schedule one preheat event for the next starting block today
-        schedules, settings, _ml, _mlpr = self._data()
-        now = dt_util.now()
-        now_min = now.hour * 60 + now.minute
-        for primary, info in (mlpr.items() if isinstance(mlpr, dict) else []):
-            try:
-                cycles = int(info.get("cycles", 0))
-                avg_pre = float(info.get("avg_preheat_min", 0.0)) if cycles >= 1 else None
-                if cycles < min_needed or not isinstance(avg_pre, (int, float)) or avg_pre <= 0:
-                    continue
-                row = schedules.get(primary)
-                if not isinstance(row, dict):
-                    continue
-                blocks = AutoApplyManager(self.hass)._effective_blocks_today(row, settings)
-                # Find the next block that starts after now
-                nxt = None
-                for b in blocks:
-                    s = int(b.get("startMin", -1))
-                    if s > now_min and (nxt is None or s < nxt[0]):
-                        # Compute the desired setpoint as if at the block start (includes away/min/max rules)
-                        aam = AutoApplyManager(self.hass)
-                        # Provide data to helper
-                        def _gd():
-                            return schedules, settings
-                        aam._get_data = _gd  # type: ignore
-                        want = None
-                        try:
-                            want = float(aam._desired_for(primary, schedules, settings, s))
-                        except Exception:
-                            try:
-                                want = float(b.get("temp"))
-                            except Exception:
-                                want = None
-                        nxt = (s, want)
-                if not nxt:
-                    continue
-                start_min, desired_at_start = nxt
-                if not isinstance(desired_at_start, (int, float)):
-                    continue
-                preheat_total = float(avg_pre) + float(safety)
-                trigger_min = start_min - int(round(preheat_total))
-                # Compute trigger datetime today
-                delta_min = trigger_min - now_min
-                if delta_min <= 0:
-                    continue
-                trigger_dt = dt_util.as_utc(now + timedelta(minutes=delta_min))
-                @callback
-                def _ph_cb(_ts):
-                    self.hass.async_create_task(self._on_preheat_trigger(primary, float(desired_at_start)))
-                unsub = async_track_point_in_utc_time(self.hass, _ph_cb, trigger_dt)
-                self._preheat_timers[primary] = unsub
-            except Exception:
-                continue
-
-    async def _on_preheat_trigger(self, primary: str, desired_c: float):
-        # Apply upcoming block target early and start measurement; also emit decision
-        try:
-            mgr: AutoApplyManager = self.hass.data[DOMAIN].get("manager")
-            if mgr and isinstance(desired_c, (int, float)):
-                # Respect the same gating (pause/auto_apply) as normal path
-                if not mgr._auto_apply_enabled():
-                    raise Exception("auto_apply disabled or paused; skip early start apply")
-                # Apply to primary and its merges
-                schedules, settings, _ml, _mlpr = self._data()
-                merges = settings.get("merges") or {}
-                group = [primary] + list(merges.get(primary) or [])
-                for eid in group:
-                    await mgr._apply_setpoint(eid, float(desired_c))
-        except Exception:
-            pass
-        try:
-            async_dispatcher_send(self.hass, SIGNAL_DECISION, {"type": "earlystart", "primaries": [primary]})
-        except Exception:
-            pass
-        await self._begin_session(primary, target_override=float(desired_c))
-
-    async def _do_sample(self):
-        if not self._enabled():
-            return
-        schedules, settings, _ml, _mlpr = self._data()
-        merges = settings.get("merges") or {}
-        # For each primary room (keys of schedules)
-        for primary in list(schedules.keys()):
-            amb = self._room_ambient_c(primary)
-            tgt = self._room_target_c(primary)
-            if amb is None or tgt is None:
-                continue
-            # Only continue if a session is active (start is triggered by set_temperature service call)
-            session = self._active.get(primary)
-            if session is None:
-                continue
-            # Append sample
-            try:
-                session["samples"].append((self._now_iso(), float(amb)))
-            except Exception:
-                pass
-            # Check target reached
-            if amb + 0.1 >= tgt:
-                await self._close_session(primary, success=True)
-            # If target far below ambient (cooling/off), abort session
-            elif (amb - tgt) > 1.0:
-                await self._close_session(primary, success=False)
-
-    def _primary_of(self, eid: str) -> str | None:
-        # If eid is a primary in schedules, return it; else find primary that lists it in merges
-        schedules, settings, _ml, _mlpr = self._data()
-        if eid in schedules:
-            return eid
-        merges = settings.get("merges") or {}
-        for p, lst in (merges.items() if isinstance(merges, dict) else []):
-            try:
-                if eid in (lst or []):
-                    return p
-            except Exception:
-                continue
-        return None
-
-    async def _begin_session(self, primary: str, target_override: float | None):
-        def _record(reason: str, amb, tgt):
-            try:
-                d = self.hass.data[DOMAIN]
-                d["ml_debug_last_begin_attempt"] = {
-                    "ts": self._now_iso(),
-                    "primary": primary,
-                    "reason": reason,
-                    "ambient_c": amb if isinstance(amb, (int, float)) else None,
-                    "target_c": tgt if isinstance(tgt, (int, float)) else None,
-                    "override_c": target_override if isinstance(target_override, (int, float)) else None,
-                    "enabled": self._enabled(),
-                    "already_active": bool(self._active.get(primary)),
-                }
-                async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-            except Exception:
-                pass
-        if not self._enabled():
-            _record("skipped_disabled", None, None)
-            return
-        if self._active.get(primary):
-            _record("skipped_already_active", None, None)
-            return
-        amb = self._room_ambient_c(primary)
-        tgt = target_override if isinstance(target_override, (int, float)) else self._room_target_c(primary)
-        if amb is None:
-            _record("skipped_no_ambient", amb, tgt)
-            return
-        if tgt is None:
-            _record("skipped_no_target", amb, tgt)
-            return
-        self._active[primary] = {
-            "start_iso": self._now_iso(),
-            "target_c": float(tgt),
-            "ambient_start_c": float(amb),
-            "outside_start_c": self._outside_now_c(),
-            "samples": []
-        }
-        # Update status to learning
-        d = self.hass.data[DOMAIN]
-        d["ml_status"] = "learning"
-        async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-        _record("started", amb, tgt)
-
-    async def _close_session(self, primary: str, success: bool):
-        sess = self._active.pop(primary, None)
-        if not sess:
-            return
-        try:
-            start = dt_util.parse_datetime(sess.get("start_iso"))
-            end = dt_util.utcnow()
-            dur_min = max(0.0, (end - start).total_seconds() / 60.0)
-        except Exception:
-            dur_min = None
-        # Persist into ml_per_room history
-        d = self.hass.data[DOMAIN]
-        mlpr = d.get("ml_per_room") or {}
-        room = mlpr.get(primary) or {"cycles": 0, "samples_count": 0}
-        sample = {
-            "start_iso": sess.get("start_iso"),
-            "target_c": sess.get("target_c"),
-            "ambient_start_c": sess.get("ambient_start_c"),
-            "duration_min": dur_min,
-            "success": bool(success),
-            "outside_start_c": sess.get("outside_start_c"),
-        }
-        hist = room.get("history") or []
-        hist.append(sample)
-        # Prune by history days (~ cap by count: keep last N=5000 as safety)
-        room["history"] = hist[-5000:]
-        room["samples_count"] = len(room["history"])  # total
-        # Update cycles count for successful runs
-        if success and isinstance(dur_min, (int, float)) and dur_min > 0:
-            room["cycles"] = int(room.get("cycles", 0)) + 1
-        mlpr[primary] = room
-        d["ml_per_room"] = mlpr
-        # Touch counters and broadcast; persist lazily via save_cb
-        d["ml_trained_cycles"] = sum(int(v.get("cycles", 0)) for v in mlpr.values())
-        d["ml_status"] = "learning"
-        async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-        # Save snapshot (not on every 2-min sample, only when closing a session)
-        await self._save_cb()
-
-    async def _retrain(self):
-        # Compute simple preheat averages and confidence
-        d = self.hass.data[DOMAIN]
-        mlpr = d.get("ml_per_room") or {}
-        total_cycles = 0
-        for primary, info in list(mlpr.items()):
-            hist = [x for x in (info.get("history") or []) if bool(x.get("success")) and isinstance(x.get("duration_min"), (int, float))]
-            # prune by date based on history days
-            try:
-                days = self._hist_days()
-                cutoff = dt_util.utcnow() - timedelta(days=days)
-                def _ok(s):
-                    try:
-                        t = dt_util.parse_datetime(str(s.get("start_iso")))
-                        return t is None or t >= cutoff
-                    except Exception:
-                        return True
-                hist = [s for s in hist if _ok(s)]
-            except Exception:
-                pass
-            if hist:
-                avg = sum(float(s.get("duration_min")) for s in hist) / float(len(hist))
-                info["avg_preheat_min"] = avg
-                info["samples_count"] = len(hist)
-                total_cycles += int(info.get("cycles", 0))
-            mlpr[primary] = info
-        d["ml_per_room"] = mlpr
-        d["ml_trained_cycles"] = total_cycles
-        min_needed = self._min_samples()
-        d["ml_enabled"] = self._enabled()
-        d["ml_status"] = ("active" if total_cycles >= min_needed and self._enabled() else ("learning" if self._enabled() else "disabled"))
-        try:
-            conf = 100.0 * float(total_cycles) / float(min_needed or 1)
-            d["ml_confidence_pct"] = max(0.0, min(100.0, conf))
-        except Exception:
-            d["ml_confidence_pct"] = None
-        try:
-            d["ml_last_trained_iso"] = dt_util.utcnow().isoformat()
-        except Exception:
-            pass
-        async_dispatcher_send(self.hass, SIGNAL_UPDATED)
-        await self._save_cb()
-
-    async def _apply_setpoint(self, eid: str, desired: float) -> bool:
-        """Apply desired setpoint robustly across HVAC modes.
-
-        Strategy:
-        - If device exposes range (target_temp_low/high) and mode is heat_cool/auto, set a band around desired.
-        - If preset supports a manual/hold, switch to it first.
-        - If current mode is off/dry/fan_only, try switching to heat, else cool.
-        - Fallback to single temperature set.
-        """
-        try:
-            st = self.hass.states.get(eid)
-            if not st:
-                return False
-            attrs = st.attributes or {}
-            hvac_mode = str(attrs.get("hvac_mode", st.state)).lower()
-            hvac_modes = [str(x).lower() for x in (attrs.get("hvac_modes") or [])]
-            preset_mode = str(attrs.get("preset_mode", "") or "").lower()
-            preset_modes = [str(x).lower() for x in (attrs.get("preset_modes") or [])]
-            min_t = attrs.get("min_temp")
-            max_t = attrs.get("max_temp")
-
-            def _clamp(val: float) -> float:
-                try:
-                    if isinstance(min_t, (int, float)):
-                        val = max(val, float(min_t))
-                    if isinstance(max_t, (int, float)):
-                        val = min(val, float(max_t))
-                except Exception:
-                    pass
-                return val
-
-            # If preset has a manual/hold and not active, switch to it
-            try:
-                want_preset = None
-                for cand in ("manual", "hold"):
-                    if cand in preset_modes:
-                        want_preset = cand
-                        break
-                if want_preset and preset_mode != want_preset:
-                    await self.hass.services.async_call(
-                        "climate", "set_preset_mode", {"entity_id": eid, "preset_mode": want_preset}, blocking=False
-                    )
-            except Exception:
-                pass
-
-            # If in a mode that ignores temperature, try switching to a workable one
-            try:
-                if hvac_mode in ("off", "dry", "fan_only"):
-                    new_mode = None
-                    if "heat" in hvac_modes:
-                        new_mode = "heat"
-                    elif "cool" in hvac_modes:
-                        new_mode = "cool"
-                    if new_mode:
-                        await self.hass.services.async_call(
-                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode}, blocking=False
-                        )
-                        hvac_mode = new_mode
-            except Exception:
-                pass
-
-            # Decide whether to use range or single setpoint
-            has_low = isinstance(attrs.get("target_temp_low"), (int, float)) or ("target_temp_low" in attrs)
-            has_high = isinstance(attrs.get("target_temp_high"), (int, float)) or ("target_temp_high" in attrs)
-            use_range = (hvac_mode in ("heat_cool", "auto")) and has_low and has_high
-
-            if use_range:
-                # Build a narrow band around desired
-                band = 1.0
-                try:
-                    # Allow global override via settings.range_band_c
-                    _s, settings = self._get_data()
-                    band = float(settings.get("range_band_c", 1.0))
-                except Exception:
-                    pass
-                half = max(0.2, band / 2.0)
-                low = _clamp(desired - half)
-                high = _clamp(desired + half)
-                if high <= low:
-                    # Ensure valid ordering
-                    high = min(_clamp(low + 0.5), _clamp(desired + 0.5))
-                data = {"entity_id": eid, "target_temp_low": float(low), "target_temp_high": float(high)}
-                await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
-                return True
-
-            # Fallback: single temperature
-            data = {"entity_id": eid, "temperature": float(_clamp(desired))}
-            await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
-            return True
-        except Exception:
-            return False
-
-
 class BackupManager:
     def __init__(self, hass: HomeAssistant, backup_cb):
         self.hass = hass
         self._unsub_timer = None
         self._backup_cb = backup_cb
-        self._unsub_store = None
 
     def _settings(self):
         d = self.hass.data.get(DOMAIN, {})
@@ -1947,15 +1113,7 @@ class BackupManager:
         @callback
         def _on_update():
             self.hass.async_create_task(self._schedule_next())
-        self._unsub_store = async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
-
-    async def async_stop(self):
-        if self._unsub_timer:
-            self._unsub_timer()
-            self._unsub_timer = None
-        if self._unsub_store:
-            self._unsub_store()
-            self._unsub_store = None
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
 
     async def _schedule_next(self):
         if self._unsub_timer:
