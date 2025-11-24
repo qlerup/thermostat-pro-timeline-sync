@@ -4,10 +4,22 @@ set_store:
   fields:
     schedules:
       name: Schedules
-      description: Object mapping entity_id -> {defaultTemp, blocks:[...]}.
+      description: Object mapping entity_id -> {defaultTemp, blocks:[...]}. When provided, it is split automatically into the main and weekday sections.
       required: false
       example: >
         {"climate.kitchen":{"defaultTemp":20,"blocks":[{"from":"06:00","to":"08:00","temp":21}]}}
+      selector:
+        object: {}
+    schedules_main:
+      name: Schedules (main)
+      description: Optional direct payload for the main schedules section (defaultTemp, blocks, profiles, presence, holiday).
+      required: false
+      selector:
+        object: {}
+    schedules_weekday:
+      name: Schedules (weekday)
+      description: Optional direct payload for weekday data (weekly, weekly_modes).
+      required: false
       selector:
         object: {}
     settings:
@@ -18,6 +30,20 @@ set_store:
         {"min_temp":5,"max_temp":25,"away":{"enabled":true,"persons":["person.me"],"target_c":17},"merges":{"climate.living":["climate.living_2"]},"auto_apply_enabled":true}
       selector:
         object: {}
+    colors:
+      name: Colors (optional)
+      description: Color ranges and color_global flag stored in the dedicated color sensor. When omitted, values extracted from the settings payload are reused.
+      required: false
+      example: >
+        {"color_ranges":{"*":[{"from":18,"to":22,"color":"#ff6600"}]},"color_global":true}
+      selector:
+        object: {}
+    force:
+      name: Force save
+      description: Force a save and version bump even if data is unchanged.
+      required: false
+      selector:
+        boolean: {}
 
 patch_entity:
   name: Patch single entity
