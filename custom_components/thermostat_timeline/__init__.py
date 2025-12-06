@@ -10,82 +10,14 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispat
 from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
-import copy
 
-from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
+from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY, BACKUP_SLOT_MAX
 from homeassistant.helpers import entity_registry as er
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _empty_colors() -> dict:
-    return {"color_ranges": {}, "color_global": False}
-
-
-def _normalize_colors(payload) -> dict:
-    if not isinstance(payload, dict):
-        return _empty_colors()
-    color_ranges = payload.get("color_ranges")
-    if not isinstance(color_ranges, dict):
-        color_ranges = {}
-    return {
-        "color_ranges": color_ranges,
-        "color_global": bool(payload.get("color_global", False)),
-    }
-
-
-def _split_schedules(full: dict) -> tuple[dict, dict]:
-    main: dict = {}
-    weekday: dict = {}
-    if not isinstance(full, dict):
-        return main, weekday
-    for eid, row in full.items():
-        if not isinstance(row, dict):
-            continue
-        row_main = {}
-        row_week = {}
-        for key, value in row.items():
-            if key in ("weekly", "weekly_modes"):
-                if value is not None:
-                    row_week[key] = value
-            else:
-                row_main[key] = value
-        if row_main:
-            main[eid] = row_main
-        if row_week:
-            weekday[eid] = row_week
-    return main, weekday
-
-
-def _merge_schedules(main: dict, weekday: dict) -> dict:
-    merged = {}
-    if isinstance(main, dict):
-        for eid, row in main.items():
-            if isinstance(row, dict):
-                merged[eid] = copy.deepcopy(row)
-    if isinstance(weekday, dict):
-        for eid, row in weekday.items():
-            if not isinstance(row, dict):
-                continue
-            target = merged.setdefault(eid, {})
-            if "weekly" in row:
-                target["weekly"] = copy.deepcopy(row["weekly"])
-            if "weekly_modes" in row:
-                target["weekly_modes"] = copy.deepcopy(row["weekly_modes"])
-    return merged
-
-
-def _combine_settings(settings_base: dict, colors: dict) -> dict:
-    base = copy.deepcopy(settings_base or {})
-    col = colors or {}
-    if "color_ranges" in col:
-        base["color_ranges"] = copy.deepcopy(col["color_ranges"])
-    if "color_global" in col:
-        base["color_global"] = bool(col["color_global"])
-    return base
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # YAML fallback: hvis brugeren har 'thermostat_timeline:' i configuration.yaml
@@ -106,95 +38,84 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
-
-    raw_settings = copy.deepcopy(data.get("settings") or {})
-    raw_colors = data.get("colors")
-    if raw_colors is None and isinstance(raw_settings, dict):
-        extracted = {}
-        if "color_ranges" in raw_settings:
-            extracted["color_ranges"] = raw_settings.pop("color_ranges")
-        if "color_global" in raw_settings:
-            extracted["color_global"] = raw_settings.pop("color_global")
-        raw_colors = extracted
-    settings_section = raw_settings if isinstance(raw_settings, dict) else {}
-    colors_section = _normalize_colors(raw_colors)
-
-    raw_main = data.get("schedules_main")
-    raw_weekday = data.get("schedules_weekday")
-    if raw_main is None and raw_weekday is None:
-        old_sched = data.get("schedules", {})
-        raw_main, raw_weekday = _split_schedules(old_sched)
-
-    hass.data[DOMAIN]["settings_section"] = copy.deepcopy(settings_section)
-    hass.data[DOMAIN]["colors_section"] = colors_section
-    hass.data[DOMAIN]["schedules_main"] = copy.deepcopy(raw_main or {})
-    hass.data[DOMAIN]["schedules_weekday"] = copy.deepcopy(raw_weekday or {})
-    hass.data[DOMAIN]["schedules"] = _merge_schedules(
-        hass.data[DOMAIN]["schedules_main"],
-        hass.data[DOMAIN]["schedules_weekday"],
-    )
-    hass.data[DOMAIN]["settings"] = _combine_settings(
-        hass.data[DOMAIN]["settings_section"],
-        hass.data[DOMAIN]["colors_section"],
-    )
-
-    versions_raw = data.get("versions") or {}
-    base_version = int(data.get("version", 1)) or 1
-
-    def _init_version(key: str) -> int:
-        try:
-            value = int(versions_raw.get(key))
-            if value > 0:
-                return value
-        except Exception:
-            pass
-        return base_version
-
-    hass.data[DOMAIN]["versions"] = {
-        "settings": _init_version("settings"),
-        "colors": _init_version("colors"),
-        "schedules_main": _init_version("schedules_main"),
-        "schedules_weekday": _init_version("schedules_weekday"),
-    }
-    hass.data[DOMAIN]["version"] = max(hass.data[DOMAIN]["versions"].values())
+    hass.data[DOMAIN]["schedules"] = data.get("schedules", {})
+    hass.data[DOMAIN]["weekday_schedules"] = data.get("weekdays", {}) or {}
+    hass.data[DOMAIN]["profile_schedules"] = data.get("profiles", {}) or {}
+    hass.data[DOMAIN]["settings"] = data.get("settings", {})
+    hass.data[DOMAIN]["colors"] = data.get("colors", {}) or {}
+    hass.data[DOMAIN]["version"] = int(data.get("version", 1))
+    # Track a separate version for settings-only changes (for the new settings sensor)
+    hass.data[DOMAIN]["settings_version"] = int(data.get("settings_version", data.get("version", 1)))
+    # Track a separate version for colors-only changes
+    hass.data[DOMAIN]["colors_version"] = int(data.get("colors_version", data.get("version", 1)))
+    # Track a separate version for weekday-only changes
+    hass.data[DOMAIN]["weekday_version"] = int(data.get("weekday_version", data.get("version", 1)))
+    # Track a separate version for profiles-only changes
+    hass.data[DOMAIN]["profile_version"] = int(data.get("profile_version", data.get("version", 1)))
     # Backup payloads
     hass.data[DOMAIN]["backup_schedules"] = backup_data.get("schedules", {})
     hass.data[DOMAIN]["backup_settings"] = backup_data.get("settings", {})
+    hass.data[DOMAIN]["backup_weekdays"] = backup_data.get("weekdays", {}) or {}
+    hass.data[DOMAIN]["backup_profiles"] = backup_data.get("profiles", {}) or {}
     hass.data[DOMAIN]["backup_version"] = int(backup_data.get("version", 1))
     hass.data[DOMAIN]["backup_last_ts"] = backup_data.get("last_backup_ts")
     # Track whether the backup is partial and which sections it includes
     hass.data[DOMAIN]["backup_partial_flags"] = backup_data.get("partial_flags")
+    # Rolling backup slots (fixed positions 1..BACKUP_SLOT_MAX) + next index
+    slots = backup_data.get("slots", [])
+    if not isinstance(slots, list):
+        slots = []
+    slots = slots[:BACKUP_SLOT_MAX]
+    # Pad with Nones so slot numbers stay fixed (1-based)
+    if len(slots) < BACKUP_SLOT_MAX:
+        slots = slots + [None] * (BACKUP_SLOT_MAX - len(slots))
+    # Determine next write index; default to append semantics for legacy data
+    try:
+        next_idx = backup_data.get("slot_index", None)
+        next_idx = int(next_idx) if next_idx is not None else None
+    except Exception:
+        next_idx = None
+    if next_idx is None:
+        # Continue after last filled slot; wrap if full
+        filled = sum(1 for s in slots if s)
+        next_idx = filled % BACKUP_SLOT_MAX
+    if next_idx < 0 or next_idx >= BACKUP_SLOT_MAX:
+        next_idx = 0
+    hass.data[DOMAIN]["backup_slots"] = slots
+    hass.data[DOMAIN]["backup_slot_index"] = next_idx
+
+    # Migrate legacy entity_id sensor.thermostat_timeline -> sensor.thermostat_timeline_schedules
+    try:
+        ent_reg = er.async_get(hass)
+        old_id = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
+        if old_id == "sensor.thermostat_timeline":
+            ent_reg.async_update_entity(old_id, new_entity_id="sensor.thermostat_timeline_schedules", name="Schedules")
+    except Exception:
+        pass
 
     async def _save_and_broadcast():
         # Broadcast first so UI updates immediately
         async_dispatcher_send(hass, SIGNAL_UPDATED)
-        # Proactively nudge individual sensors to refresh immediately
+        # Proactively nudge the overview sensor to update its state in HA
         try:
             ent_reg = er.async_get(hass)
-            for uid in (
-                "thermostat_timeline_settings",
-                "thermostat_timeline_colors",
-                "thermostat_timeline_schedules",
-                "thermostat_timeline_weekdays",
-            ):
-                sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, uid)
-                if sensor_eid:
-                    await hass.services.async_call(
-                        "homeassistant",
-                        "update_entity",
-                        {"entity_id": sensor_eid},
-                        blocking=False,
-                    )
+            sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
+            if sensor_eid:
+                await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
         except Exception:
             pass
         try:
             await store.async_save({
-                "schedules_main": hass.data[DOMAIN].get("schedules_main", {}),
-                "schedules_weekday": hass.data[DOMAIN].get("schedules_weekday", {}),
-                "settings": hass.data[DOMAIN].get("settings_section", {}),
-                "colors": hass.data[DOMAIN].get("colors_section", _empty_colors()),
-                "versions": hass.data[DOMAIN].get("versions", {}),
+                "schedules": hass.data[DOMAIN]["schedules"],
+                "weekdays": hass.data[DOMAIN].get("weekday_schedules", {}),
+                "profiles": hass.data[DOMAIN].get("profile_schedules", {}),
+                "settings": hass.data[DOMAIN].get("settings", {}),
+                "colors": hass.data[DOMAIN].get("colors", {}),
                 "version": hass.data[DOMAIN]["version"],
+                "settings_version": hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN]["version"]),
+                "colors_version": hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"]),
+                "weekday_version": hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"]),
+                "profile_version": hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"]),
             })
         except Exception:
             # Storage failure shouldn't block UI update
@@ -207,9 +128,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             await backup_store.async_save({
                 "schedules": hass.data[DOMAIN].get("backup_schedules", {}),
                 "settings": hass.data[DOMAIN].get("backup_settings", {}),
+                "weekdays": hass.data[DOMAIN].get("backup_weekdays", {}),
+                "profiles": hass.data[DOMAIN].get("backup_profiles", {}),
                 "version": hass.data[DOMAIN].get("backup_version", 1),
                 "last_backup_ts": hass.data[DOMAIN].get("backup_last_ts"),
                 "partial_flags": hass.data[DOMAIN].get("backup_partial_flags"),
+                "slots": hass.data[DOMAIN].get("backup_slots", []),
+                "slot_index": hass.data[DOMAIN].get("backup_slot_index", 0),
             })
             # Proactively nudge the backup sensor to update its state in HA
             try:
@@ -222,150 +147,207 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception:
             _LOGGER.warning("%s: failed to save backup store", DOMAIN)
 
-    def _bump(section: str):
-        versions = hass.data[DOMAIN].setdefault("versions", {})
-        try:
-            versions[section] = int(versions.get(section, 1)) + 1
-        except Exception:
-            versions[section] = 1
-
-    def _update_combined_settings():
-        hass.data[DOMAIN]["settings"] = _combine_settings(
-            hass.data[DOMAIN].get("settings_section", {}),
-            hass.data[DOMAIN].get("colors_section", _empty_colors()),
-        )
-
-    def _set_settings_base(new_base: dict | None) -> bool:
-        cur = hass.data[DOMAIN].get("settings_section", {}) or {}
-        incoming = copy.deepcopy(new_base or {})
-        if incoming == cur:
-            return False
-        hass.data[DOMAIN]["settings_section"] = incoming
-        _update_combined_settings()
-        _bump("settings")
-        return True
-
-    def _set_colors_section(new_colors: dict | None) -> bool:
-        incoming = _normalize_colors(new_colors)
-        cur = hass.data[DOMAIN].get("colors_section") or _empty_colors()
-        if incoming == cur:
-            return False
-        hass.data[DOMAIN]["colors_section"] = incoming
-        _update_combined_settings()
-        _bump("colors")
-        return True
-
-    def _set_schedule_sections(main: dict | None, weekday: dict | None) -> set[str]:
-        changed: set[str] = set()
-        if main is not None:
-            incoming = copy.deepcopy(main)
-            if incoming != hass.data[DOMAIN].get("schedules_main", {}):
-                hass.data[DOMAIN]["schedules_main"] = incoming
-                changed.add("schedules_main")
-        if weekday is not None:
-            incoming = copy.deepcopy(weekday)
-            if incoming != hass.data[DOMAIN].get("schedules_weekday", {}):
-                hass.data[DOMAIN]["schedules_weekday"] = incoming
-                changed.add("schedules_weekday")
-        if changed:
-            hass.data[DOMAIN]["schedules"] = _merge_schedules(
-                hass.data[DOMAIN].get("schedules_main", {}),
-                hass.data[DOMAIN].get("schedules_weekday", {}),
-            )
-            for sec in changed:
-                _bump(sec)
-        return changed
-
-    def _set_full_schedules(full: dict | None) -> bool:
-        main, weekday = _split_schedules(full or {})
-        changed = _set_schedule_sections(main, weekday)
-        return bool(changed)
-
     async def set_store(call: ServiceCall):
         force = bool(call.data.get("force"))
+        cur_sched = hass.data[DOMAIN].get("schedules", {})
+        cur_set = hass.data[DOMAIN].get("settings", {})
+        cur_colors = hass.data[DOMAIN].get("colors", {})
+        cur_week = hass.data[DOMAIN].get("weekday_schedules", {})
+        cur_prof = hass.data[DOMAIN].get("profile_schedules", {})
         changed = False
+        sched_changed = False
+        settings_changed = False
+        colors_changed = False
+        weekday_changed = False
+        profile_changed = False
 
         if "schedules" in call.data:
             schedules = call.data.get("schedules")
             if not isinstance(schedules, dict):
                 _LOGGER.warning("%s.set_store: schedules must be an object when provided", DOMAIN)
                 return
-            changed |= _set_full_schedules(schedules)
-        else:
-            if "schedules_main" in call.data:
-                main_section = call.data.get("schedules_main")
-                if not isinstance(main_section, dict):
-                    _LOGGER.warning("%s.set_store: schedules_main must be an object when provided", DOMAIN)
-                    return
-                changed |= bool(_set_schedule_sections(main_section, None))
-            if "schedules_weekday" in call.data:
-                week_section = call.data.get("schedules_weekday")
-                if not isinstance(week_section, dict):
-                    _LOGGER.warning("%s.set_store: schedules_weekday must be an object when provided", DOMAIN)
-                    return
-                changed |= bool(_set_schedule_sections(None, week_section))
+            if force or schedules != cur_sched:
+                hass.data[DOMAIN]["schedules"] = schedules
+                sched_changed = True
+                changed = True
+            if "weekdays" not in call.data:
+                try:
+                    new_week = {}
+                    for eid, row in (schedules.items() if isinstance(schedules, dict) else []):
+                        if not isinstance(row, dict):
+                            continue
+                        wk = {}
+                        if "weekly" in row:
+                            wk["weekly"] = row["weekly"]
+                        if "weekly_modes" in row:
+                            wk["weekly_modes"] = row["weekly_modes"]
+                        if wk:
+                            new_week[eid] = wk
+                    if force or new_week != cur_week:
+                        hass.data[DOMAIN]["weekday_schedules"] = new_week
+                        weekday_changed = True
+                        changed = True
+                except Exception:
+                    pass
+            if "profiles" not in call.data:
+                try:
+                    new_prof = {}
+                    for eid, row in (schedules.items() if isinstance(schedules, dict) else []):
+                        if not isinstance(row, dict):
+                            continue
+                        pr = {}
+                        if "profiles" in row:
+                            pr["profiles"] = row["profiles"]
+                        if "activeProfile" in row:
+                            pr["activeProfile"] = row["activeProfile"]
+                        if pr:
+                            new_prof[eid] = pr
+                    if force or new_prof != cur_prof:
+                        hass.data[DOMAIN]["profile_schedules"] = new_prof
+                        profile_changed = True
+                        changed = True
+                except Exception:
+                    pass
 
-        colors_payload = call.data.get("colors") if isinstance(call.data.get("colors"), dict) else None
-        settings_payload = call.data.get("settings") if isinstance(call.data.get("settings"), dict) else None
+        if "settings" in call.data:
+            settings = call.data.get("settings")
+            if isinstance(settings, dict):
+                if force or settings != cur_set:
+                    hass.data[DOMAIN]["settings"] = settings
+                    settings_changed = True
+                    changed = True
+                c_ranges = settings.get("color_ranges")
+                c_global = settings.get("color_global")
+                if c_ranges is not None or c_global is not None:
+                    hass.data[DOMAIN]["colors"] = {
+                        "color_ranges": c_ranges if c_ranges is not None else cur_colors.get("color_ranges", {}),
+                        "color_global": c_global if c_global is not None else cur_colors.get("color_global", False),
+                    }
+                    changed = True
+                    settings_changed = True
+                    colors_changed = True
 
-        if settings_payload is not None:
-            settings_copy = copy.deepcopy(settings_payload)
-            extracted_colors = {}
-            if "color_ranges" in settings_copy:
-                extracted_colors["color_ranges"] = settings_copy.pop("color_ranges")
-            if "color_global" in settings_copy:
-                extracted_colors["color_global"] = settings_copy.pop("color_global")
-            if extracted_colors:
-                if colors_payload:
-                    merged_colors = dict(colors_payload)
-                    merged_colors.update(extracted_colors)
-                    colors_payload = merged_colors
-                else:
-                    colors_payload = extracted_colors
-            # DEBUG: Log all received settings
-            try:
-                import json
-                _LOGGER.warning("[TT DEBUG] set_store received settings: %s", json.dumps(settings_copy, ensure_ascii=False))
-            except Exception as e:
-                _LOGGER.warning("[TT DEBUG] set_store logging error: %s", str(e))
-            changed |= _set_settings_base(settings_copy)
+        if "colors" in call.data:
+            colors = call.data.get("colors")
+            if isinstance(colors, dict):
+                if force or colors != cur_colors:
+                    hass.data[DOMAIN]["colors"] = colors
+                    colors_changed = True
+                    changed = True
 
-        if colors_payload is not None:
-            changed |= _set_colors_section(colors_payload)
+        if "weekdays" in call.data:
+            weekdays = call.data.get("weekdays")
+            if isinstance(weekdays, dict):
+                if force or weekdays != cur_week:
+                    hass.data[DOMAIN]["weekday_schedules"] = weekdays
+                    weekday_changed = True
+                    changed = True
+                try:
+                    for eid, wk in (weekdays.items() if isinstance(weekdays, dict) else []):
+                        if not isinstance(wk, dict):
+                            continue
+                        row = dict(hass.data[DOMAIN].get("schedules", {}).get(eid, {}))
+                        if "weekly" in wk:
+                            row["weekly"] = wk["weekly"]
+                        if "weekly_modes" in wk:
+                            row["weekly_modes"] = wk["weekly_modes"]
+                        hass.data[DOMAIN].setdefault("schedules", {})[eid] = row
+                        sched_changed = True
+                except Exception:
+                    pass
+
+        if "profiles" in call.data:
+            profiles = call.data.get("profiles")
+            if isinstance(profiles, dict):
+                if force or profiles != cur_prof:
+                    hass.data[DOMAIN]["profile_schedules"] = profiles
+                    profile_changed = True
+                    changed = True
+                try:
+                    for eid, pdata in (profiles.items() if isinstance(profiles, dict) else []):
+                        if not isinstance(pdata, dict):
+                            continue
+                        row = dict(hass.data[DOMAIN].get("schedules", {}).get(eid, {}))
+                        if "profiles" in pdata:
+                            row["profiles"] = pdata["profiles"]
+                        if "activeProfile" in pdata:
+                            row["activeProfile"] = pdata["activeProfile"]
+                        hass.data[DOMAIN].setdefault("schedules", {})[eid] = row
+                        sched_changed = True
+                except Exception:
+                    pass
 
         if not changed and not force:
-            # No-op: nothing changed and not forced; avoid spurious version bump/apply
             return
 
-        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+        if sched_changed:
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        if settings_changed:
+            hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN].get("version", 1))) + 1
+            if not sched_changed:
+                hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        if colors_changed:
+            hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN].get("version", 1))) + 1
+            if not sched_changed:
+                hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        if weekday_changed:
+            hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN].get("version", 1))) + 1
+            if not sched_changed:
+                hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        if profile_changed:
+            hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN].get("version", 1))) + 1
+            if not sched_changed:
+                hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        if force and not sched_changed and not settings_changed:
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+            hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN]["version"])) + 1
+            hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"])) + 1
+            hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
+            hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
+        await _save_and_broadcast()
+
+    async def clear_store(call: ServiceCall):
+        # Explicit clear: wipe schedules + settings and bump both versions once
+        hass.data[DOMAIN]["schedules"] = {}
+        hass.data[DOMAIN]["weekday_schedules"] = {}
+        hass.data[DOMAIN]["profile_schedules"] = {}
+        hass.data[DOMAIN]["settings"] = {}
+        hass.data[DOMAIN]["colors"] = {}
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 0)) + 1
+        hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
         await _save_and_broadcast()
 
     async def backup_now(call: ServiceCall):
         """Create a backup of the current store.
 
         Supports selective sections via optional booleans:
-          - main: base daily schedules (defaultTemp, blocks, profiles)
+          - main: base daily schedules (defaultTemp, blocks)
           - weekday: weekday schedules (weekly, weekly_modes)
           - presence: presence schedules (advanced away combos per room)
           - settings: editor/global settings (except color ranges)
           - holiday: holiday schedules per room
           - colors: color ranges and color mode
+          - profiles: profile schedules (profiles, activeProfile)
         If no flags are provided, a full backup is made (backwards compatible).
         """
-        # Determine requested sections (default: all True)
         want_main = bool(call.data.get("main", True))
         want_week = bool(call.data.get("weekday", True))
         want_presence = bool(call.data.get("presence", True))
         want_settings = bool(call.data.get("settings", True))
         want_holiday = bool(call.data.get("holiday", True))
         want_colors = bool(call.data.get("colors", True))
+        want_profiles = bool(call.data.get("profiles", True))
 
         src_sched = hass.data[DOMAIN].get("schedules", {}) or {}
+        src_week = hass.data[DOMAIN].get("weekday_schedules", {}) or {}
+        src_prof = hass.data[DOMAIN].get("profile_schedules", {}) or {}
         src_set = hass.data[DOMAIN].get("settings", {}) or {}
 
-        # Build selective schedules
         out_sched: dict = {}
-        if any([want_main, want_week, want_presence, want_holiday]):
+        if any([want_main, want_week, want_presence, want_holiday, want_profiles]):
             for eid, row in (src_sched.items() if isinstance(src_sched, dict) else []):
                 if not isinstance(row, dict):
                     continue
@@ -375,15 +357,28 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         new_row["defaultTemp"] = row["defaultTemp"]
                     if "blocks" in row:
                         new_row["blocks"] = row["blocks"]
-                    # Include profiles data in main
-                    if "profiles" in row:
+                if want_profiles:
+                    prof_src = src_prof.get(eid, {}) if isinstance(src_prof, dict) else {}
+                    if "profiles" in prof_src:
+                        new_row["profiles"] = prof_src["profiles"]
+                    elif "profiles" in row:
                         new_row["profiles"] = row["profiles"]
-                    if "activeProfile" in row:
+                    if "activeProfile" in prof_src:
+                        new_row["activeProfile"] = prof_src["activeProfile"]
+                    elif "activeProfile" in row:
                         new_row["activeProfile"] = row["activeProfile"]
                 if want_week:
-                    if "weekly" in row:
+                    try:
+                        wk_src = src_week.get(eid, {}) if isinstance(src_week, dict) else {}
+                    except Exception:
+                        wk_src = {}
+                    if "weekly" in wk_src:
+                        new_row["weekly"] = wk_src["weekly"]
+                    elif "weekly" in row:
                         new_row["weekly"] = row["weekly"]
-                    if "weekly_modes" in row:
+                    if "weekly_modes" in wk_src:
+                        new_row["weekly_modes"] = wk_src["weekly_modes"]
+                    elif "weekly_modes" in row:
                         new_row["weekly_modes"] = row["weekly_modes"]
                 if want_presence and "presence" in row:
                     new_row["presence"] = row["presence"]
@@ -392,10 +387,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if new_row:
                     out_sched[eid] = new_row
 
-        # Build selective settings
         out_set: dict = {}
         if want_settings:
-            # Copy all settings except colors (handled below)
             for k, v in (src_set.items() if isinstance(src_set, dict) else []):
                 if k in ("color_ranges", "color_global"):
                     continue
@@ -406,7 +399,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if "color_global" in src_set:
                 out_set["color_global"] = src_set["color_global"]
 
-        # If no flags explicitly provided (legacy), store a full backup
         legacy_full = (
             "main" not in call.data
             and "weekday" not in call.data
@@ -414,15 +406,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             and "settings" not in call.data
             and "holiday" not in call.data
             and "colors" not in call.data
+            and "profiles" not in call.data
         )
 
         if legacy_full:
             hass.data[DOMAIN]["backup_schedules"] = dict(src_sched)
             hass.data[DOMAIN]["backup_settings"] = dict(src_set)
+            hass.data[DOMAIN]["backup_profiles"] = dict(src_prof)
+            hass.data[DOMAIN]["backup_weekdays"] = dict(src_week)
             hass.data[DOMAIN]["backup_partial_flags"] = None
         else:
             hass.data[DOMAIN]["backup_schedules"] = out_sched
             hass.data[DOMAIN]["backup_settings"] = out_set
+            hass.data[DOMAIN]["backup_profiles"] = {k: v for k, v in (src_prof.items() if isinstance(src_prof, dict) else [])} if want_profiles else {}
+            hass.data[DOMAIN]["backup_weekdays"] = {k: v for k, v in (src_week.items() if isinstance(src_week, dict) else [])}
             hass.data[DOMAIN]["backup_partial_flags"] = {
                 "main": want_main,
                 "weekday": want_week,
@@ -430,7 +427,45 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "settings": want_settings,
                 "holiday": want_holiday,
                 "colors": want_colors,
+                "profiles": want_profiles,
             }
+
+        # Maintain rolling backup slots (fixed positions 1..N, ring buffer)
+        try:
+            slots = hass.data[DOMAIN].get("backup_slots", [])
+            if not isinstance(slots, list):
+                slots = []
+            if len(slots) < BACKUP_SLOT_MAX:
+                slots = slots + [None] * (BACKUP_SLOT_MAX - len(slots))
+            # Colors come from live colors store (matches colors sensor)
+            backup_colors = hass.data[DOMAIN].get("colors", {}) or {}
+            entry = {
+                "ts": dt_util.utcnow().isoformat(),
+                "version": hass.data[DOMAIN].get("version", 1),
+                "settings_version": hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN].get("version", 1)),
+                "weekday_version": hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN].get("version", 1)),
+                "profile_version": hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN].get("version", 1)),
+                "colors_version": hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN].get("version", 1)),
+                "partial_flags": hass.data[DOMAIN].get("backup_partial_flags"),
+                "sections": {
+                    "schedules": hass.data[DOMAIN].get("backup_schedules", {}),
+                    "settings": hass.data[DOMAIN].get("backup_settings", {}),
+                    "weekdays": hass.data[DOMAIN].get("backup_weekdays", {}),
+                    "profiles": hass.data[DOMAIN].get("backup_profiles", {}),
+                    "colors": backup_colors,
+                },
+            }
+            try:
+                idx = int(hass.data[DOMAIN].get("backup_slot_index", 0))
+            except Exception:
+                idx = 0
+            if idx < 0 or idx >= BACKUP_SLOT_MAX:
+                idx = 0
+            slots[idx] = entry
+            hass.data[DOMAIN]["backup_slot_index"] = (idx + 1) % BACKUP_SLOT_MAX
+            hass.data[DOMAIN]["backup_slots"] = slots
+        except Exception:
+            pass
 
         hass.data[DOMAIN]["backup_version"] = int(hass.data[DOMAIN].get("backup_version", 1)) + 1
         try:
@@ -443,40 +478,70 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Restore from backup.
 
         Optional mode: 'replace' (default) or 'merge'.
-        Optional section flags like backup_now: main, weekday, presence, settings, holiday, colors.
+        Optional section flags like backup_now: main, weekday, presence, settings, holiday, colors, profiles.
+        Optional slot (1-based) to restore from rolling backup slots.
         If backup contains partial_flags and no mode is provided, merge is used by default.
         """
+        slot_num = call.data.get("slot")
+        slot_entry = None
+        if slot_num is not None:
+            try:
+                idx = int(slot_num) - 1
+                slots = hass.data[DOMAIN].get("backup_slots", []) if isinstance(hass.data[DOMAIN].get("backup_slots", []), list) else []
+                if 0 <= idx < len(slots):
+                    slot_entry = slots[idx]
+            except Exception:
+                slot_entry = None
+
         mode = str(call.data.get("mode", "")).lower().strip()
         flags = hass.data[DOMAIN].get("backup_partial_flags") or {}
         # Allow caller to override flags
-        for key in ("main","weekday","presence","settings","holiday","colors"):
+        for key in ("main","weekday","presence","settings","holiday","colors","profiles"):
             if key in call.data:
                 flags[key] = bool(call.data.get(key))
 
-        backup_sched = hass.data[DOMAIN].get("backup_schedules", {}) or {}
-        backup_set = hass.data[DOMAIN].get("backup_settings", {}) or {}
+        sections = None
+        if slot_entry and isinstance(slot_entry, dict):
+            sections = slot_entry.get("sections", {}) if isinstance(slot_entry.get("sections"), dict) else {}
+            flags = slot_entry.get("partial_flags") or flags
+
+        backup_sched = (sections.get("schedules") if sections else None) or hass.data[DOMAIN].get("backup_schedules", {}) or {}
+        backup_set = (sections.get("settings") if sections else None) or hass.data[DOMAIN].get("backup_settings", {}) or {}
+        backup_week = (sections.get("weekdays") if sections else None) or hass.data[DOMAIN].get("backup_weekdays", {}) or {}
+        backup_prof = (sections.get("profiles") if sections else None) or hass.data[DOMAIN].get("backup_profiles", {}) or {}
 
         # If no flags and mode empty, keep legacy behavior (replace)
         if not flags and mode not in ("merge", "replace"):
-            await set_store(ServiceCall(DOMAIN, "set_store", {
-                "schedules": copy.deepcopy(backup_sched),
-                "settings": copy.deepcopy(backup_set),
-                "force": True,
-            }))
+            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
+            hass.data[DOMAIN]["settings"] = dict(backup_set)
+            hass.data[DOMAIN]["weekday_schedules"] = dict(backup_week)
+            hass.data[DOMAIN]["profile_schedules"] = dict(backup_prof)
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+            hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", 1)) + 1
+            hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", 1)) + 1
+            hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", 1)) + 1
+            await _save_and_broadcast()
             return
 
         do_merge = (mode == "merge") or (not mode and bool(flags))
         if not do_merge:
-            await set_store(ServiceCall(DOMAIN, "set_store", {
-                "schedules": copy.deepcopy(backup_sched),
-                "settings": copy.deepcopy(backup_set),
-                "force": True,
-            }))
+            # Explicit replace
+            hass.data[DOMAIN]["schedules"] = dict(backup_sched)
+            hass.data[DOMAIN]["settings"] = dict(backup_set)
+            hass.data[DOMAIN]["weekday_schedules"] = dict(backup_week)
+            hass.data[DOMAIN]["profile_schedules"] = dict(backup_prof)
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+            hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", 1)) + 1
+            hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", 1)) + 1
+            hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", 1)) + 1
+            await _save_and_broadcast()
             return
 
         # Merge: only update selected sections/keys
         cur_sched = hass.data[DOMAIN].get("schedules", {}) or {}
         cur_set = hass.data[DOMAIN].get("settings", {}) or {}
+        cur_week = hass.data[DOMAIN].get("weekday_schedules", {}) or {}
+        cur_prof = hass.data[DOMAIN].get("profile_schedules", {}) or {}
 
         want_main = bool(flags.get("main", False))
         want_week = bool(flags.get("weekday", False))
@@ -484,8 +549,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         want_settings = bool(flags.get("settings", False))
         want_holiday = bool(flags.get("holiday", False))
         want_colors = bool(flags.get("colors", False))
+        want_profiles = bool(flags.get("profiles", False))
 
-        if any([want_main, want_week, want_presence, want_holiday]):
+        if any([want_main, want_week, want_presence, want_holiday, want_profiles]):
             for eid, brow in (backup_sched.items() if isinstance(backup_sched, dict) else []):
                 if not isinstance(brow, dict):
                     continue
@@ -495,14 +561,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         row["defaultTemp"] = brow["defaultTemp"]
                     if "blocks" in brow:
                         row["blocks"] = brow["blocks"]
-                    if "profiles" in brow:
+                if want_profiles:
+                    prof_src = backup_prof.get(eid, {}) if isinstance(backup_prof, dict) else {}
+                    if "profiles" in prof_src:
+                        row["profiles"] = prof_src["profiles"]
+                    elif "profiles" in brow:
                         row["profiles"] = brow["profiles"]
-                    if "activeProfile" in brow:
+                    if "activeProfile" in prof_src:
+                        row["activeProfile"] = prof_src["activeProfile"]
+                    elif "activeProfile" in brow:
                         row["activeProfile"] = brow["activeProfile"]
                 if want_week:
-                    if "weekly" in brow:
+                    wk_src = backup_week.get(eid, {}) if isinstance(backup_week, dict) else {}
+                    if "weekly" in wk_src:
+                        row["weekly"] = wk_src["weekly"]
+                    elif "weekly" in brow:
                         row["weekly"] = brow["weekly"]
-                    if "weekly_modes" in brow:
+                    if "weekly_modes" in wk_src:
+                        row["weekly_modes"] = wk_src["weekly_modes"]
+                    elif "weekly_modes" in brow:
                         row["weekly_modes"] = brow["weekly_modes"]
                 if want_presence and "presence" in brow:
                     row["presence"] = brow["presence"]
@@ -519,11 +596,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     continue
                 cur_set[k] = v
 
-        await set_store(ServiceCall(DOMAIN, "set_store", {
-            "schedules": cur_sched,
-            "settings": cur_set,
-            "force": True,
-        }))
+        if want_week:
+            hass.data[DOMAIN]["weekday_schedules"] = {k: v for k, v in (backup_week.items() if isinstance(backup_week, dict) else [])}
+        else:
+            hass.data[DOMAIN]["weekday_schedules"] = cur_week
+        if want_profiles:
+            hass.data[DOMAIN]["profile_schedules"] = {k: v for k, v in (backup_prof.items() if isinstance(backup_prof, dict) else [])}
+        else:
+            hass.data[DOMAIN]["profile_schedules"] = cur_prof
+
+        hass.data[DOMAIN]["schedules"] = cur_sched
+        hass.data[DOMAIN]["settings"] = cur_set
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 1)) + 1
+        hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", 1)) + 1
+        if want_week:
+            hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", 1)) + 1
+        if want_profiles:
+            hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", 1)) + 1
+        await _save_and_broadcast()
 
     async def patch_entity(call: ServiceCall):
         eid = str(call.data.get("entity_id","")).strip()
@@ -531,19 +621,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not eid or not isinstance(d, dict):
             _LOGGER.warning("%s.patch_entity: invalid args", DOMAIN)
             return
-        all_sched = copy.deepcopy(hass.data[DOMAIN].get("schedules", {}) or {})
-        cur = dict(all_sched.get(eid, {}))
-        if "defaultTemp" in d:
-            cur["defaultTemp"] = d["defaultTemp"]
-        if "blocks" in d and isinstance(d["blocks"], list):
-            cur["blocks"] = d["blocks"]
-        all_sched[eid] = cur
-        await set_store(ServiceCall(DOMAIN, "set_store", {"schedules": all_sched, "force": True}))
+        cur = dict(hass.data[DOMAIN]["schedules"].get(eid, {}))
+        if "defaultTemp" in d: cur["defaultTemp"] = d["defaultTemp"]
+        if "blocks" in d and isinstance(d["blocks"], list): cur["blocks"] = d["blocks"]
+        hass.data[DOMAIN]["schedules"][eid] = cur
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        await _save_and_broadcast()
 
     async def clear(call: ServiceCall):
-        await set_store(ServiceCall(DOMAIN, "set_store", {"schedules": {}, "force": True}))
+        hass.data[DOMAIN]["schedules"] = {}
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
+        await _save_and_broadcast()
 
     hass.services.async_register(DOMAIN, "set_store", set_store)
+    hass.services.async_register(DOMAIN, "clear_store", clear_store)
     hass.services.async_register(DOMAIN, "backup_now", backup_now)
     hass.services.async_register(DOMAIN, "restore_now", restore_now)
     hass.services.async_register(DOMAIN, "patch_entity", patch_entity)
@@ -939,8 +1030,8 @@ class AutoApplyManager:
         self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
 
     async def _timer_fire(self):
-        # Kun auto-apply ved block boundary (timeren)
-        await self._maybe_apply_now(force=True, boundary_only=True)
+        # If this wake was caused by pause expiry, apply immediately across all entities
+        await self._maybe_apply_now(force=True, boundary_only=(not self._next_is_resume))
         self._next_is_resume = False
         await self._schedule_next()
 
@@ -955,7 +1046,8 @@ class AutoApplyManager:
         if (away.get("enabled") or away.get("advanced_enabled")) and isinstance(persons, list) and persons:
             @callback
             def _ch(event):
-                # Kun schedule next, ingen auto-apply
+                # Apply immediately when presence changes
+                self.hass.async_create_task(self._maybe_apply_now(force=True))
                 self.hass.async_create_task(self._schedule_next())
             self._unsub_persons = async_track_state_change_event(self.hass, persons, _ch)
 
