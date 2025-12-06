@@ -2,5 +2,6 @@ DOMAIN = "thermostat_timeline"
 STORAGE_KEY = DOMAIN
 STORAGE_VERSION = 1
 SIGNAL_UPDATED = f"{DOMAIN}_updated"
-SIGNAL_DECISION = f"{DOMAIN}_decision"  # emitted when a schedule/early-start apply decision is taken
 BACKUP_STORAGE_KEY = f"{DOMAIN}_backup"
+# Maximum number of rolling backup slots
+BACKUP_SLOT_MAX = 10
