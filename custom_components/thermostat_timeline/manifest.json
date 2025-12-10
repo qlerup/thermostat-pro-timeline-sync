@@ -6,6 +6,7 @@
   "documentation": "https://github.com/qlerup/thermostat-pro-timeline-sync",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/qlerup/thermostat-pro-timeline-sync/issues",
+  ""dependencies": ["http"],
   "requirements": [],
   "version": "1.0.0"
 }
