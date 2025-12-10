@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import traceback
 
 from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.config_entries import ConfigEntry
@@ -10,14 +12,124 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispat
 from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
+from homeassistant.components.http import HomeAssistantView
 
-from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY, BACKUP_SLOT_MAX
-from homeassistant.helpers import entity_registry as er
+from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _dbg(msg: str) -> None:
+    """Write lightweight debug info to local debug.log without crashing."""
+    try:
+        base = os.path.dirname(__file__)
+        with open(os.path.join(base, "debug.log"), "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dict:
+    """Build a JSON-serializable snapshot of the current timeline state."""
+    if not hass or DOMAIN not in hass.data:
+        # Return safe defaults if integration not yet loaded
+        _dbg("build_state_payload: hass or DOMAIN missing, returning defaults")
+        return {
+            "version": 1,
+            "settings_version": 1,
+            "colors_version": 1,
+            "weekday_version": 1,
+            "profile_version": 1,
+            "backup_version": 1,
+        } if versions_only else {
+            "version": 1,
+            "settings_version": 1,
+            "colors_version": 1,
+            "weekday_version": 1,
+            "profile_version": 1,
+            "backup_version": 1,
+            "schedules": {},
+            "weekdays": {},
+            "profiles": {},
+            "settings": {},
+            "colors": {},
+            "backup": {"slots": [], "slot_index": 0, "schedules": {}, "settings": {}, "weekdays": {}, "profiles": {}, "version": 1, "last_backup_ts": None, "partial_flags": None},
+        }
+    data = hass.data[DOMAIN]
+    payload = {
+        "version": int(data.get("version", 1)),
+        "settings_version": int(data.get("settings_version", data.get("version", 1))),
+        "colors_version": int(data.get("colors_version", data.get("version", 1))),
+        "weekday_version": int(data.get("weekday_version", data.get("version", 1))),
+        "profile_version": int(data.get("profile_version", data.get("version", 1))),
+        "backup_version": int(data.get("backup_version", 1)),
+    }
+    if versions_only:
+        return payload
+    payload.update({
+        "schedules": data.get("schedules", {}),
+        "weekdays": data.get("weekday_schedules", {}),
+        "profiles": data.get("profile_schedules", {}),
+        "settings": data.get("settings", {}),
+        "colors": data.get("colors", {}),
+        "backup": {
+            "slots": data.get("backup_slots", []),
+            "slot_index": data.get("backup_slot_index", 0),
+            "schedules": data.get("backup_schedules", {}),
+            "settings": data.get("backup_settings", {}),
+            "weekdays": data.get("backup_weekdays", {}),
+            "profiles": data.get("backup_profiles", {}),
+            "version": data.get("backup_version", 1),
+            "last_backup_ts": data.get("backup_last_ts"),
+            "partial_flags": data.get("backup_partial_flags"),
+        },
+    })
+    return payload
+
+
+class ThermostatTimelineStateView(HomeAssistantView):
+    url = "/api/thermostat_timeline/state"
+    name = "api:thermostat_timeline_state"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        try:
+            _dbg("API /state requested")
+            payload = build_state_payload(self.hass, versions_only=False)
+            _LOGGER.debug("API /state requested, version=%s", payload.get("version"))
+            _dbg(f"API /state returning version={payload.get('version')}")
+            return self.json(payload)
+        except Exception as e:
+            _LOGGER.error("API /state failed: %s", e, exc_info=True)
+            _dbg("API /state failed: " + str(e) + "\n" + traceback.format_exc())
+            return self.json({"error": str(e)}, status_code=500)
+
+
+class ThermostatTimelineVersionView(HomeAssistantView):
+    url = "/api/thermostat_timeline/version"
+    name = "api:thermostat_timeline_version"
+    requires_auth = True
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+
+    async def get(self, request):
+        try:
+            _dbg("API /version requested")
+            payload = build_state_payload(self.hass, versions_only=True)
+            _LOGGER.debug("API /version requested, returning: %s", payload)
+            _dbg(f"API /version returning: {payload}")
+            return self.json(payload)
+        except Exception as e:
+            _LOGGER.error("API /version failed: %s", e, exc_info=True)
+            _dbg("API /version failed: " + str(e) + "\n" + traceback.format_exc())
+            return self.json({"error": str(e)}, status_code=500)
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     # YAML fallback: hvis brugeren har 'thermostat_timeline:' i configuration.yaml
@@ -35,6 +147,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = await store.async_load() or {}
     backup_store = Store(hass, STORAGE_VERSION, f"{BACKUP_STORAGE_KEY}.json")
     backup_data = await backup_store.async_load() or {}
+
+    _dbg("async_setup_entry: loaded data version=" + str(data.get("version")))
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
@@ -61,49 +175,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN]["backup_last_ts"] = backup_data.get("last_backup_ts")
     # Track whether the backup is partial and which sections it includes
     hass.data[DOMAIN]["backup_partial_flags"] = backup_data.get("partial_flags")
-    # Rolling backup slots (fixed positions 1..BACKUP_SLOT_MAX) + next index
     slots = backup_data.get("slots", [])
     if not isinstance(slots, list):
         slots = []
-    slots = slots[:BACKUP_SLOT_MAX]
-    # Pad with Nones so slot numbers stay fixed (1-based)
-    if len(slots) < BACKUP_SLOT_MAX:
-        slots = slots + [None] * (BACKUP_SLOT_MAX - len(slots))
-    # Determine next write index; default to append semantics for legacy data
-    try:
-        next_idx = backup_data.get("slot_index", None)
-        next_idx = int(next_idx) if next_idx is not None else None
-    except Exception:
-        next_idx = None
-    if next_idx is None:
-        # Continue after last filled slot; wrap if full
-        filled = sum(1 for s in slots if s)
-        next_idx = filled % BACKUP_SLOT_MAX
-    if next_idx < 0 or next_idx >= BACKUP_SLOT_MAX:
-        next_idx = 0
-    hass.data[DOMAIN]["backup_slots"] = slots
-    hass.data[DOMAIN]["backup_slot_index"] = next_idx
+    # Normalize: only dict entries or None
+    norm_slots = []
+    for entry in slots:
+        if isinstance(entry, dict):
+            norm_slots.append(entry)
+        else:
+            norm_slots.append(None)
+    hass.data[DOMAIN]["backup_slots"] = norm_slots
+    hass.data[DOMAIN]["backup_slot_index"] = len([s for s in norm_slots if s])
 
-    # Migrate legacy entity_id sensor.thermostat_timeline -> sensor.thermostat_timeline_schedules
-    try:
-        ent_reg = er.async_get(hass)
-        old_id = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
-        if old_id == "sensor.thermostat_timeline":
-            ent_reg.async_update_entity(old_id, new_entity_id="sensor.thermostat_timeline_schedules", name="Schedules")
-    except Exception:
-        pass
+    _dbg("async_setup_entry: setup complete, version=" + str(hass.data[DOMAIN]["version"]))
 
     async def _save_and_broadcast():
         # Broadcast first so UI updates immediately
         async_dispatcher_send(hass, SIGNAL_UPDATED)
-        # Proactively nudge the overview sensor to update its state in HA
-        try:
-            ent_reg = er.async_get(hass)
-            sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_overview")
-            if sensor_eid:
-                await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
-        except Exception:
-            pass
         try:
             await store.async_save({
                 "schedules": hass.data[DOMAIN]["schedules"],
@@ -136,16 +225,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "slots": hass.data[DOMAIN].get("backup_slots", []),
                 "slot_index": hass.data[DOMAIN].get("backup_slot_index", 0),
             })
-            # Proactively nudge the backup sensor to update its state in HA
-            try:
-                ent_reg = er.async_get(hass)
-                sensor_eid = ent_reg.async_get_entity_id("sensor", DOMAIN, "thermostat_timeline_backup")
-                if sensor_eid:
-                    await hass.services.async_call("homeassistant", "update_entity", {"entity_id": sensor_eid}, blocking=False)
-            except Exception:
-                pass
         except Exception:
             _LOGGER.warning("%s: failed to save backup store", DOMAIN)
+
+    def _latest_backup_ts(slots: list) -> str | None:
+        """Find newest backup timestamp across slots (iso string)."""
+        newest = None
+        try:
+            for slot in (slots or []):
+                if not isinstance(slot, dict):
+                    continue
+                ts = slot.get("ts") or slot.get("created_at") or slot.get("created")
+                if not ts:
+                    continue
+                try:
+                    dt = dt_util.parse_datetime(ts)
+                except Exception:
+                    dt = None
+                if dt:
+                    if not newest or dt > newest[0]:
+                        newest = (dt, ts)
+                else:
+                    # Fallback: keep first seen string when parse fails
+                    if not newest:
+                        newest = (None, ts)
+        except Exception:
+            return None
+        return newest[1] if newest else None
 
     async def set_store(call: ServiceCall):
         force = bool(call.data.get("force"))
@@ -304,6 +410,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"])) + 1
             hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
             hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
+        _LOGGER.info("set_store: version=%s, sched_changed=%s, settings_changed=%s", 
+                     hass.data[DOMAIN]["version"], sched_changed, settings_changed)
         await _save_and_broadcast()
 
     async def clear_store(call: ServiceCall):
@@ -430,13 +538,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "profiles": want_profiles,
             }
 
-        # Maintain rolling backup slots (fixed positions 1..N, ring buffer)
+        # Maintain append-only backup list (unbounded)
         try:
             slots = hass.data[DOMAIN].get("backup_slots", [])
             if not isinstance(slots, list):
                 slots = []
-            if len(slots) < BACKUP_SLOT_MAX:
-                slots = slots + [None] * (BACKUP_SLOT_MAX - len(slots))
             # Colors come from live colors store (matches colors sensor)
             backup_colors = hass.data[DOMAIN].get("colors", {}) or {}
             entry = {
@@ -455,14 +561,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "colors": backup_colors,
                 },
             }
-            try:
-                idx = int(hass.data[DOMAIN].get("backup_slot_index", 0))
-            except Exception:
-                idx = 0
-            if idx < 0 or idx >= BACKUP_SLOT_MAX:
-                idx = 0
-            slots[idx] = entry
-            hass.data[DOMAIN]["backup_slot_index"] = (idx + 1) % BACKUP_SLOT_MAX
+            # Append new entry (skip None placeholders)
+            slots = [s for s in slots if s is None or isinstance(s, dict)]
+            slots.append(entry)
+            hass.data[DOMAIN]["backup_slot_index"] = len(slots)
             hass.data[DOMAIN]["backup_slots"] = slots
         except Exception:
             pass
@@ -472,6 +574,48 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN]["backup_last_ts"] = dt_util.utcnow().isoformat()
         except Exception:
             pass
+        await _save_backup()
+
+    async def delete_backup(call: ServiceCall):
+        """Delete a specific backup slot or clear all backups when no slot is provided."""
+        slots = hass.data[DOMAIN].get("backup_slots", [])
+        if not isinstance(slots, list):
+            slots = []
+
+        slot_num = call.data.get("slot")
+        changed = False
+
+        if slot_num is not None:
+            try:
+                idx = int(slot_num) - 1
+            except Exception:
+                idx = -1
+            if 0 <= idx < len(slots):
+                try:
+                    slots.pop(idx)
+                except Exception:
+                    pass
+                else:
+                    changed = True
+        else:
+            # Clear all backup payloads and slots
+            hass.data[DOMAIN]["backup_schedules"] = {}
+            hass.data[DOMAIN]["backup_settings"] = {}
+            hass.data[DOMAIN]["backup_weekdays"] = {}
+            hass.data[DOMAIN]["backup_profiles"] = {}
+            hass.data[DOMAIN]["backup_partial_flags"] = None
+            hass.data[DOMAIN]["backup_slot_index"] = 0
+            hass.data[DOMAIN]["backup_last_ts"] = None
+            slots = []
+            changed = True
+
+        if not changed:
+            return
+
+        hass.data[DOMAIN]["backup_slots"] = slots
+        hass.data[DOMAIN]["backup_version"] = int(hass.data[DOMAIN].get("backup_version", 1)) + 1
+        hass.data[DOMAIN]["backup_slot_index"] = len(slots)
+        hass.data[DOMAIN]["backup_last_ts"] = _latest_backup_ts(slots)
         await _save_backup()
 
     async def restore_now(call: ServiceCall):
@@ -636,12 +780,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.services.async_register(DOMAIN, "set_store", set_store)
     hass.services.async_register(DOMAIN, "clear_store", clear_store)
     hass.services.async_register(DOMAIN, "backup_now", backup_now)
+    hass.services.async_register(DOMAIN, "delete_backup", delete_backup)
     hass.services.async_register(DOMAIN, "restore_now", restore_now)
     hass.services.async_register(DOMAIN, "patch_entity", patch_entity)
     hass.services.async_register(DOMAIN, "clear", clear)
     # no apply_now service (removed)
 
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor"])
+    # Expose lightweight HTTP views for clients (works over HA Cloud)
+    try:
+        hass.http.register_view(ThermostatTimelineStateView(hass))
+        hass.http.register_view(ThermostatTimelineVersionView(hass))
+    except Exception:
+        _LOGGER.warning("%s: failed to register HTTP views", DOMAIN)
 
     # ---- Background Auto-Apply Manager ----
     mgr = AutoApplyManager(hass)
@@ -654,7 +804,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    return await hass.config_entries.async_unload_platforms(entry, ["sensor"])
+    return True
 
 
 class AutoApplyManager:
