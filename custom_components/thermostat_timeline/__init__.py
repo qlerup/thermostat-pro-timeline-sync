@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import traceback
@@ -22,13 +23,27 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 _LOGGER = logging.getLogger(__name__)
 
 
+def _dbg_write_sync(path: str, msg: str) -> None:
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(msg + "\n")
+
+
 def _dbg(msg: str) -> None:
-    """Write lightweight debug info to local debug.log without crashing."""
+    """Write lightweight debug info to local debug.log without blocking the event loop."""
     try:
         base = os.path.dirname(__file__)
-        with open(os.path.join(base, "debug.log"), "a", encoding="utf-8") as fh:
-            fh.write(msg + "\n")
+        path = os.path.join(base, "debug.log")
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _dbg_write_sync(path, msg)
+            return
+
+        # Fire-and-forget file write in a worker thread.
+        loop.create_task(asyncio.to_thread(_dbg_write_sync, path, msg))
     except Exception:
+        # Debug logging must never interfere with the integration.
         pass
 
 
@@ -812,12 +827,14 @@ class AutoApplyManager:
         self.hass = hass
         self._unsub_timer = None
         self._unsub_persons = None
+        self._unsub_boiler = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
         self._next_is_resume = False
 
     async def async_start(self):
         # Apply once on startup and schedule next if enabled
         await self._maybe_apply_now(force=True)
+        await self._maybe_control_boiler(force=True)
         await self._schedule_next()
         # Re-apply on store updates
         @callback
@@ -826,14 +843,17 @@ class AutoApplyManager:
         async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_store_update)
         # Watch person.* states if away mode is used
         self._reset_person_watch()
+        self._reset_boiler_watch()
 
     async def _on_store_changed(self):
         # Respect apply_on_edit toggle: only apply immediately on store changes when enabled
         _s, settings = self._get_data()
         if bool(settings.get("apply_on_edit", True)):
             await self._maybe_apply_now(force=True)
+        await self._maybe_control_boiler(force=True)
         await self._schedule_next()
         self._reset_person_watch()
+        self._reset_boiler_watch()
 
     def _get_data(self):
         d = self.hass.data.get(DOMAIN, {})
@@ -1059,7 +1079,7 @@ class AutoApplyManager:
             pass
         return want
 
-    async def _maybe_apply_now(self, force: bool = False, boundary_only: bool = False):
+    async def _maybe_apply_now(self, force: bool = False, boundary_only: bool = False, reconcile: bool = False):
         if not self._auto_apply_enabled():
             return
         schedules, settings = self._get_data()
@@ -1067,8 +1087,8 @@ class AutoApplyManager:
         now_min = self._now_min()
         targets = self._all_targets(schedules, merges)
         for eid in targets:
-            # only climate.* entities
-            if not isinstance(eid, str) or not eid.startswith("climate."):
+            # Supported targets: climate.* and input_number.*
+            if not isinstance(eid, str) or not (eid.startswith("climate.") or eid.startswith("input_number.")):
                 continue
             if not self.hass.states.get(eid):
                 continue
@@ -1097,17 +1117,33 @@ class AutoApplyManager:
             desired = self._desired_for(eid, schedules, settings, now_min)
             if desired is None:
                 continue
-            # skip if no change
+            # Only apply when desired setpoint changes for this entity.
+            # This prevents overriding manual thermostat changes just because
+            # another room hits a new block (or any global refresh runs).
+            #
+            # Exceptions:
+            # - On resume from pause we reconcile to the desired setpoint even
+            #   if it hasn't changed (reconcile=True).
             last = self._last_applied.get(eid) or {}
-            if (not force) and last.get("min") == now_min and abs(float(last.get("temp", 9999)) - float(desired)) < 0.05:
-                continue
+            try:
+                if (not reconcile) and ("temp" in last) and abs(float(last.get("temp")) - float(desired)) < 0.05:
+                    continue
+            except Exception:
+                pass
             # If current equals desired, just update cache
             st = self.hass.states.get(eid)
             cur = None
-            for attr in ("temperature","target_temperature","target_temp"):
-                v = st.attributes.get(attr)
-                if isinstance(v, (int,float)):
-                    cur = float(v); break
+            if eid.startswith("input_number."):
+                try:
+                    cur = float(st.state)
+                except Exception:
+                    cur = None
+            else:
+                for attr in ("temperature","target_temperature","target_temp"):
+                    v = st.attributes.get(attr)
+                    if isinstance(v, (int, float)):
+                        cur = float(v)
+                        break
             if cur is not None and abs(cur - float(desired)) < 0.05:
                 self._last_applied[eid] = {"min": now_min, "temp": float(desired)}
                 continue
@@ -1180,10 +1216,124 @@ class AutoApplyManager:
         self._unsub_timer = async_track_point_in_utc_time(self.hass, _cb, when)
 
     async def _timer_fire(self):
-        # If this wake was caused by pause expiry, apply immediately across all entities
-        await self._maybe_apply_now(force=True, boundary_only=(not self._next_is_resume))
+        # If this wake was caused by pause expiry, reconcile immediately across all entities.
+        resume = bool(self._next_is_resume)
+        await self._maybe_apply_now(force=True, boundary_only=(not resume), reconcile=resume)
+        await self._maybe_control_boiler(force=True)
         self._next_is_resume = False
         await self._schedule_next()
+
+    def _reset_boiler_watch(self):
+        if self._unsub_boiler:
+            self._unsub_boiler()
+            self._unsub_boiler = None
+        _schedules, settings = self._get_data()
+        try:
+            if not bool(settings.get("boiler_enabled")):
+                return
+            sens = settings.get("boiler_temp_sensor")
+            if not isinstance(sens, str) or not sens:
+                return
+
+            @callback
+            def _ch(_event):
+                # React quickly when boiler sensor updates
+                self.hass.async_create_task(self._maybe_control_boiler(force=True))
+
+            self._unsub_boiler = async_track_state_change_event(self.hass, [sens], _ch)
+        except Exception:
+            self._unsub_boiler = None
+
+    @staticmethod
+    def _f_to_c(v: float) -> float:
+        return (float(v) - 32.0) * 5.0 / 9.0
+
+    async def _maybe_control_boiler(self, force: bool = False) -> None:
+        """Control boiler switch using hysteresis based on boiler sensor.
+
+        Rules:
+        - If sensor temp < min -> switch ON
+        - If sensor temp > max -> switch OFF
+        - Otherwise do nothing
+
+        Values in settings are stored in settings.temp_unit (C/F).
+        Sensor is interpreted from unit_of_measurement when available.
+        """
+        try:
+            if not self._auto_apply_enabled():
+                return
+            _schedules, settings = self._get_data()
+            if not bool(settings.get("boiler_enabled")):
+                return
+
+            sw = settings.get("boiler_switch")
+            sens = settings.get("boiler_temp_sensor")
+            if not isinstance(sw, str) or not sw.startswith("switch."):
+                return
+            if not isinstance(sens, str) or "." not in sens:
+                return
+
+            st_sens = self.hass.states.get(sens)
+            if not st_sens:
+                return
+            try:
+                raw = float(st_sens.state)
+            except Exception:
+                return
+
+            # Read thresholds (stored in settings temp unit)
+            unit = str(settings.get("temp_unit") or "C").upper()
+            bmin_raw = settings.get("boiler_min_temp")
+            bmax_raw = settings.get("boiler_max_temp")
+
+            if bmin_raw is None:
+                min_c = 20.0
+            else:
+                min_v = float(bmin_raw)
+                min_c = self._f_to_c(min_v) if unit == "F" else min_v
+
+            if bmax_raw is None:
+                max_c = 25.0
+            else:
+                max_v = float(bmax_raw)
+                max_c = self._f_to_c(max_v) if unit == "F" else max_v
+
+            lo = min(min_c, max_c)
+            hi = max(min_c, max_c)
+
+            # Sensor value -> °C if needed
+            val_c = raw
+            try:
+                u = st_sens.attributes.get("unit_of_measurement")
+                if isinstance(u, str) and ("°F" in u or u.strip().upper() == "F"):
+                    val_c = self._f_to_c(raw)
+            except Exception:
+                pass
+
+            want = None
+            if val_c < lo:
+                want = "on"
+            elif val_c > hi:
+                want = "off"
+            else:
+                return
+
+            st_sw = self.hass.states.get(sw)
+            cur = str(st_sw.state).lower() if st_sw else ""
+            if want == "on" and cur == "on":
+                return
+            if want == "off" and cur == "off":
+                return
+
+            await self.hass.services.async_call(
+                "switch",
+                "turn_on" if want == "on" else "turn_off",
+                {"entity_id": sw},
+                blocking=False,
+            )
+        except Exception:
+            # Boiler control must never interfere with normal schedule apply
+            return
 
     def _reset_person_watch(self):
         # Recreate person watcher based on settings.away.persons (both simple away and advanced presence)
@@ -1240,6 +1390,24 @@ class AutoApplyManager:
             st = self.hass.states.get(eid)
             if not st:
                 return False
+            # input_number support: set value directly (no HVAC modes/presets)
+            if isinstance(eid, str) and eid.startswith("input_number."):
+                attrs = st.attributes or {}
+                min_v = attrs.get("min")
+                max_v = attrs.get("max")
+
+                val = float(desired)
+                try:
+                    if isinstance(min_v, (int, float)):
+                        val = max(val, float(min_v))
+                    if isinstance(max_v, (int, float)):
+                        val = min(val, float(max_v))
+                except Exception:
+                    pass
+                await self.hass.services.async_call(
+                    "input_number", "set_value", {"entity_id": eid, "value": float(val)}, blocking=False
+                )
+                return True
             attrs = st.attributes or {}
             hvac_mode = str(attrs.get("hvac_mode", st.state)).lower()
             hvac_modes = [str(x).lower() for x in (attrs.get("hvac_modes") or [])]
