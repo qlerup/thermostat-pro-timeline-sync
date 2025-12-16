@@ -811,6 +811,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # ---- Background Auto-Apply Manager ----
     mgr = AutoApplyManager(hass)
     hass.data[DOMAIN]["manager"] = mgr
+    # ---- Open Window Detection (background) ----
+    owd = OpenWindowManager(hass, apply_mgr=mgr)
+    hass.data[DOMAIN]["open_window_manager"] = owd
+    await owd.async_start()
     await mgr.async_start()
     # ---- Backup Manager (auto backup) ----
     bkm = BackupManager(hass, backup_cb=backup_now)
@@ -900,7 +904,54 @@ class AutoApplyManager:
         idx = (dt_util.now().weekday())  # 0..6
         return ["mon","tue","wed","thu","fri","sat","sun"][idx]
 
+    def _today_iso(self) -> str:
+        """Return today's date in HA local timezone as YYYY-MM-DD."""
+        try:
+            return dt_util.now().date().isoformat()
+        except Exception:
+            return ""
+
+    def _is_holiday_active(self, settings: dict) -> bool:
+        """Determine whether Holiday mode is active.
+
+        Uses settings written by the frontend card:
+          - holidays_enabled: bool
+          - holidays_source: 'calendar' | 'manual'
+          - holidays_entity: entity id (calendar.* or binary_sensor.*)
+          - holidays_dates: ['YYYY-MM-DD', ...]
+        """
+        try:
+            if not bool(settings.get("holidays_enabled")):
+                return False
+            src = str(settings.get("holidays_source") or "calendar").lower().strip()
+            if src == "manual":
+                dates = settings.get("holidays_dates")
+                if not isinstance(dates, list) or not dates:
+                    return False
+                today = self._today_iso()
+                return any(str(d) == today for d in dates)
+
+            # calendar/binary_sensor entity
+            eid = str(settings.get("holidays_entity") or "").strip()
+            if not eid:
+                return False
+            st = self.hass.states.get(eid)
+            s = str(st.state if st else "").lower()
+            return s == "on"
+        except Exception:
+            return False
+
     def _effective_blocks_today(self, row: dict, settings: dict):
+        # Holidays override have highest precedence when enabled and active.
+        # Note: only apply holiday override when this room actually has holiday blocks.
+        try:
+            if self._is_holiday_active(settings):
+                hol = row.get("holiday") or {}
+                blk = hol.get("blocks") if isinstance(hol, dict) else None
+                if isinstance(blk, list) and len(blk) > 0:
+                    return blk
+        except Exception:
+            pass
         # Presence (advanced away) overrides if enabled and an active combo exists
         try:
             away = settings.get("away") or {}
@@ -928,7 +979,11 @@ class AutoApplyManager:
                 if ap:
                     profs = row.get("profiles") or {}
                     blk = (profs.get(ap) or {}).get("blocks")
-                    if isinstance(blk, list):
+                    # Treat empty profile blocks as "no override".
+                    # If a manual profile is active globally but a room has no
+                    # blocks defined for that profile, the room must follow its
+                    # normal schedule instead of falling back to defaultTemp.
+                    if isinstance(blk, list) and len(blk) > 0:
                         return blk
         except Exception:
             pass
@@ -1092,6 +1147,13 @@ class AutoApplyManager:
                 continue
             if not self.hass.states.get(eid):
                 continue
+            # Open Window Detection: skip applying schedules while a room is suspended
+            try:
+                owd = self.hass.data.get(DOMAIN, {}).get("open_window_manager")
+                if owd and hasattr(owd, "is_entity_suspended") and owd.is_entity_suspended(eid):
+                    continue
+            except Exception:
+                pass
             # If we are at a boundary tick (timer), only apply for entities that have a boundary now
             if boundary_only:
                 try:
@@ -1152,6 +1214,49 @@ class AutoApplyManager:
                 self._last_applied[eid] = {"min": now_min, "temp": float(desired)}
             else:
                 _LOGGER.warning("Auto-apply failed for %s", eid)
+
+    async def async_apply_entity_now(self, eid: str, reconcile: bool = False) -> None:
+        """Apply the current desired setpoint for a single entity (best-effort).
+
+        Used by other managers (e.g. Open Window Detection) to reconcile a room
+        back to schedule without forcing a global re-apply.
+        """
+        try:
+            if not isinstance(eid, str):
+                return
+            if not (eid.startswith("climate.") or eid.startswith("input_number.")):
+                return
+            if not self.hass.states.get(eid):
+                return
+            if not self._auto_apply_enabled():
+                return
+            # Respect Open Window Detection suspension
+            try:
+                owd = self.hass.data.get(DOMAIN, {}).get("open_window_manager")
+                if owd and hasattr(owd, "is_entity_suspended") and owd.is_entity_suspended(eid):
+                    return
+            except Exception:
+                pass
+
+            schedules, settings = self._get_data()
+            now_min = self._now_min()
+            desired = self._desired_for(eid, schedules, settings, now_min)
+            if desired is None:
+                return
+
+            if not reconcile:
+                last = self._last_applied.get(eid) or {}
+                try:
+                    if ("temp" in last) and abs(float(last.get("temp")) - float(desired)) < 0.05:
+                        return
+                except Exception:
+                    pass
+
+            ok = await self._apply_setpoint(eid, float(desired))
+            if ok:
+                self._last_applied[eid] = {"min": now_min, "temp": float(desired)}
+        except Exception:
+            return
 
     def _next_boundary_dt(self):
         schedules, settings = self._get_data()
@@ -1486,6 +1591,264 @@ class AutoApplyManager:
             return True
         except Exception:
             return False
+
+
+class OpenWindowManager:
+    """Background Open Window Detection.
+
+    Uses settings.open_window from the shared store.
+    """
+
+    def __init__(self, hass: HomeAssistant, apply_mgr: AutoApplyManager):
+        self.hass = hass
+        self._mgr = apply_mgr
+        self._unsub = None
+        self._room_sensors: dict[str, list[str]] = {}
+        self._open_delay_s: int = 0
+        self._close_delay_s: int = 0
+        self._room_tasks: dict[tuple[str, str], asyncio.Task] = {}  # (room, kind)
+        self._suspended_entities: set[str] = set()
+
+    def is_entity_suspended(self, eid: str) -> bool:
+        try:
+            return isinstance(eid, str) and eid in self._suspended_entities
+        except Exception:
+            return False
+
+    def _settings(self) -> dict:
+        return (self.hass.data.get(DOMAIN, {}) or {}).get("settings", {}) or {}
+
+    def _enabled(self, settings: dict | None = None) -> bool:
+        try:
+            settings = settings if isinstance(settings, dict) else self._settings()
+            ow = settings.get("open_window") or {}
+            if not (isinstance(ow, dict) and bool(ow.get("enabled"))):
+                return False
+            # Only run when background control is active
+            if not bool(settings.get("auto_apply_enabled")):
+                return False
+            # Respect pause gates
+            if bool(settings.get("pause_indef")):
+                return False
+            pu = settings.get("pause_until_ms")
+            if isinstance(pu, (int, float)):
+                now_ms = dt_util.utcnow().timestamp() * 1000.0
+                if float(pu) > now_ms:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clamp_int(v, default: int, lo: int, hi: int) -> int:
+        try:
+            n = int(float(v))
+        except Exception:
+            n = int(default)
+        return max(lo, min(hi, n))
+
+    @staticmethod
+    def _is_open_state(state: str) -> bool:
+        s = str(state or "").strip().lower()
+        return s in ("on", "open", "true", "1")
+
+    def _sensor_open(self, eid: str) -> bool:
+        try:
+            st = self.hass.states.get(eid)
+            return self._is_open_state(st.state if st else "")
+        except Exception:
+            return False
+
+    def _entities_for_room(self, room_eid: str, settings: dict) -> list[str]:
+        out = [room_eid]
+        try:
+            merges = settings.get("merges") or {}
+            linked = merges.get(room_eid) or []
+            if isinstance(linked, list):
+                out.extend([x for x in linked if isinstance(x, str) and x])
+        except Exception:
+            pass
+        seen = set()
+        uniq = []
+        for e in out:
+            if e in seen:
+                continue
+            seen.add(e)
+            uniq.append(e)
+        return uniq
+
+    def _cancel_task(self, room: str, kind: str) -> None:
+        t = self._room_tasks.pop((room, kind), None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    async def async_start(self) -> None:
+        @callback
+        def _on_update():
+            self.hass.async_create_task(self._rebuild())
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
+        await self._rebuild()
+
+    async def _rebuild(self) -> None:
+        # Unsubscribe old watcher
+        try:
+            if self._unsub:
+                self._unsub()
+                self._unsub = None
+        except Exception:
+            self._unsub = None
+
+        # Cancel pending tasks
+        for k, t in list(self._room_tasks.items()):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        self._room_tasks.clear()
+
+        settings = self._settings()
+        ow = settings.get("open_window") or {}
+        self._open_delay_s = self._clamp_int(ow.get("open_delay_min"), 2, 0, 1440) * 60
+        self._close_delay_s = self._clamp_int(ow.get("close_delay_min"), 5, 0, 1440) * 60
+
+        sensors_map = ow.get("sensors") if isinstance(ow, dict) else None
+        room_sensors: dict[str, list[str]] = {}
+        flat: list[str] = []
+        if isinstance(sensors_map, dict):
+            for room, arr in sensors_map.items():
+                if not isinstance(room, str) or not room:
+                    continue
+                if not isinstance(arr, list) or not arr:
+                    continue
+                clean = [x for x in arr if isinstance(x, str) and x.startswith("binary_sensor.")]
+                if not clean:
+                    continue
+                room_sensors[room] = clean
+                flat.extend(clean)
+
+        self._room_sensors = room_sensors
+
+        # If disabled, resume anything we previously turned off
+        if not self._enabled(settings):
+            await self._resume_all(settings)
+            return
+
+        flat = sorted(set(flat))
+        if flat:
+            @callback
+            def _ch(_event):
+                self.hass.async_create_task(self._evaluate_all())
+            self._unsub = async_track_state_change_event(self.hass, flat, _ch)
+
+        await self._evaluate_all()
+
+    async def _evaluate_all(self) -> None:
+        try:
+            settings = self._settings()
+            if not self._enabled(settings):
+                await self._resume_all(settings)
+                return
+            for room in list(self._room_sensors.keys()):
+                await self._evaluate_room(room, settings)
+        except Exception:
+            return
+
+    async def _evaluate_room(self, room: str, settings: dict) -> None:
+        sensors = self._room_sensors.get(room) or []
+        if not sensors:
+            await self._resume_room(room, settings)
+            return
+
+        open_now = any(self._sensor_open(s) for s in sensors)
+        is_susp = any(e in self._suspended_entities for e in self._entities_for_room(room, settings))
+
+        if open_now:
+            self._cancel_task(room, "resume")
+            if not is_susp and (room, "suspend") not in self._room_tasks:
+                self._room_tasks[(room, "suspend")] = self.hass.async_create_task(self._delayed_suspend(room))
+        else:
+            self._cancel_task(room, "suspend")
+            if is_susp and (room, "resume") not in self._room_tasks:
+                self._room_tasks[(room, "resume")] = self.hass.async_create_task(self._delayed_resume(room))
+
+    async def _delayed_suspend(self, room: str) -> None:
+        try:
+            if self._open_delay_s:
+                await asyncio.sleep(self._open_delay_s)
+            settings = self._settings()
+            if not self._enabled(settings):
+                return
+            sensors = self._room_sensors.get(room) or []
+            if sensors and any(self._sensor_open(s) for s in sensors):
+                await self._suspend_room(room, settings)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    async def _delayed_resume(self, room: str) -> None:
+        try:
+            if self._close_delay_s:
+                await asyncio.sleep(self._close_delay_s)
+            settings = self._settings()
+            if not self._enabled(settings):
+                return
+            sensors = self._room_sensors.get(room) or []
+            if sensors and any(self._sensor_open(s) for s in sensors):
+                return
+            await self._resume_room(room, settings)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    async def _suspend_room(self, room: str, settings: dict) -> None:
+        try:
+            entities = self._entities_for_room(room, settings)
+            for eid in entities:
+                self._suspended_entities.add(eid)
+            for eid in entities:
+                if isinstance(eid, str) and eid.startswith("climate."):
+                    await self.hass.services.async_call("climate", "turn_off", {"entity_id": eid}, blocking=False)
+        except Exception:
+            return
+
+    async def _resume_room(self, room: str, settings: dict) -> None:
+        try:
+            entities = self._entities_for_room(room, settings)
+            for eid in entities:
+                try:
+                    self._suspended_entities.discard(eid)
+                except Exception:
+                    pass
+            for eid in entities:
+                if isinstance(eid, str) and eid.startswith("climate."):
+                    await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                try:
+                    await self._mgr.async_apply_entity_now(eid, reconcile=True)
+                except Exception:
+                    pass
+        except Exception:
+            return
+
+    async def _resume_all(self, settings: dict) -> None:
+        try:
+            if not self._suspended_entities:
+                return
+            to_resume = list(self._suspended_entities)
+            self._suspended_entities.clear()
+            for eid in to_resume:
+                if isinstance(eid, str) and eid.startswith("climate."):
+                    await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                try:
+                    await self._mgr.async_apply_entity_now(eid, reconcile=True)
+                except Exception:
+                    pass
+        except Exception:
+            return
 
 
 class BackupManager:
