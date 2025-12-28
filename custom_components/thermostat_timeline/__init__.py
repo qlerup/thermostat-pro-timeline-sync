@@ -5,16 +5,17 @@ import logging
 import os
 import traceback
 
-from homeassistant.core import HomeAssistant, ServiceCall, callback
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.storage import Store
-from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect
-from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event
-from homeassistant.util import dt as dt_util
+from homeassistant.core import HomeAssistant, ServiceCall, callback  # type: ignore[reportMissingImports]
+from homeassistant.config_entries import ConfigEntry  # type: ignore[reportMissingImports]
+from homeassistant.helpers import config_validation as cv  # type: ignore[reportMissingImports]
+from homeassistant.helpers.storage import Store  # type: ignore[reportMissingImports]
+from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect  # type: ignore[reportMissingImports]
+from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event  # type: ignore[reportMissingImports]
+from homeassistant.util import dt as dt_util  # type: ignore[reportMissingImports]
 from datetime import timedelta
-from homeassistant.components.http import HomeAssistantView
-from homeassistant.const import UnitOfTemperature
+from homeassistant.components.http import HomeAssistantView  # type: ignore[reportMissingImports]
+from homeassistant.const import UnitOfTemperature  # type: ignore[reportMissingImports]
+from typing import Any, Optional
 
 from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
 
@@ -56,7 +57,7 @@ def _dbg(msg: str) -> None:
         pass
 
 
-def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dict:
+def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dict[str, Any]:
     """Build a JSON-serializable snapshot of the current timeline state."""
     if not hass or DOMAIN not in hass.data:
         # Return safe defaults if integration not yet loaded
@@ -83,7 +84,7 @@ def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dic
             "backup": {"slots": [], "slot_index": 0, "schedules": {}, "settings": {}, "weekdays": {}, "profiles": {}, "version": 1, "last_backup_ts": None, "partial_flags": None},
         }
     data = hass.data[DOMAIN]
-    payload = {
+    payload: dict[str, Any] = {
         "version": int(data.get("version", 1)),
         "settings_version": int(data.get("settings_version", data.get("version", 1))),
         "colors_version": int(data.get("colors_version", data.get("version", 1))),
@@ -998,7 +999,8 @@ class AutoApplyManager:
                     # Presence combo is active but this room has no presence schedule:
                     # return a virtual all‑day block at Away temperature
                     try:
-                        target = float(away.get("target_c")) if "target_c" in away else None
+                        val = (away.get("target_c") if isinstance(away, dict) else None)
+                        target = float(val) if isinstance(val, (int, float, str)) else None
                         if target is not None:
                             return [{"id": "__presence_away__", "startMin": 0, "endMin": 1440, "temp": target}]
                     except Exception:
@@ -1081,7 +1083,7 @@ class AutoApplyManager:
                 out.add(e)
         return out
 
-    def _desired_for(self, eid: str, schedules: dict, settings: dict, now_min: int):
+    def _desired_for(self, eid: str, schedules: dict, settings: dict, now_min: int) -> Optional[float]:
         # Resolve primary (merged)
         merges = settings.get("merges") or {}
         primary = None
@@ -1123,15 +1125,20 @@ class AutoApplyManager:
                 continue
         # Base desired setpoint
         if hit is not None:
-            want = float(hit.get("temp"))
+            v = hit.get("temp") if isinstance(hit, dict) else None
+            if isinstance(v, (int, float, str)):
+                want = float(v)
+            else:
+                want = float(row.get("defaultTemp", 20))
         else:
             # When advanced presence is active but this room has no presence schedule,
             # use Away temperature instead of the room default.
             if presence_key_active and not room_has_presence_blocks:
                 try:
                     away = settings.get("away") or {}
-                    if "target_c" in away:
-                        want = float(away.get("target_c"))
+                    val = away.get("target_c")
+                    if isinstance(val, (int, float, str)):
+                        want = float(val)
                     else:
                         want = float(row.get("defaultTemp", 20))
                 except Exception:
@@ -1221,10 +1228,12 @@ class AutoApplyManager:
             #   if it hasn't changed (reconcile=True).
             last = self._last_applied.get(eid) or {}
             try:
-                if (not reconcile) and ("temp" in last) and abs(float(last.get("temp")) - float(desired)) < 0.05:
-                    continue
+                lt = last.get("temp")
+                last_temp = float(lt) if isinstance(lt, (int, float, str)) else None
             except Exception:
-                pass
+                last_temp = None
+            if (not reconcile) and (last_temp is not None) and abs(last_temp - float(desired)) < 0.05:
+                continue
             # If current equals desired, just update cache
             st = self.hass.states.get(eid)
             cur = None
@@ -1280,10 +1289,12 @@ class AutoApplyManager:
             if not reconcile:
                 last = self._last_applied.get(eid) or {}
                 try:
-                    if ("temp" in last) and abs(float(last.get("temp")) - float(desired)) < 0.05:
-                        return
+                    lt = last.get("temp")
+                    last_temp = float(lt) if isinstance(lt, (int, float, str)) else None
                 except Exception:
-                    pass
+                    last_temp = None
+                if (last_temp is not None) and abs(last_temp - float(desired)) < 0.05:
+                    return
 
             ok = await self._apply_setpoint(eid, float(desired))
             if ok:
