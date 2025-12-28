@@ -14,6 +14,7 @@ from homeassistant.helpers.event import async_track_point_in_utc_time, async_tra
 from homeassistant.util import dt as dt_util
 from datetime import timedelta
 from homeassistant.components.http import HomeAssistantView
+from homeassistant.const import UnitOfTemperature
 
 from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION, SIGNAL_UPDATED, BACKUP_STORAGE_KEY
 
@@ -21,6 +22,14 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _c_to_f(c: float) -> float:
+    return (float(c) * 9.0 / 5.0) + 32.0
+
+
+def _f_to_c(f: float) -> float:
+    return (float(f) - 32.0) * 5.0 / 9.0
 
 
 def _dbg_write_sync(path: str, msg: str) -> None:
@@ -832,6 +841,8 @@ class AutoApplyManager:
         self._unsub_timer = None
         self._unsub_persons = None
         self._unsub_boiler = None
+        self._unsub_pause_sensor = None
+        self._last_pause_sensor_on: bool | None = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
         self._next_is_resume = False
 
@@ -848,6 +859,7 @@ class AutoApplyManager:
         # Watch person.* states if away mode is used
         self._reset_person_watch()
         self._reset_boiler_watch()
+        self._reset_pause_sensor_watch()
 
     async def _on_store_changed(self):
         # Respect apply_on_edit toggle: only apply immediately on store changes when enabled
@@ -858,6 +870,21 @@ class AutoApplyManager:
         await self._schedule_next()
         self._reset_person_watch()
         self._reset_boiler_watch()
+        self._reset_pause_sensor_watch()
+
+    def _pause_sensor_on(self, settings: dict) -> bool:
+        """Return True when pause is requested via binary sensor."""
+        try:
+            if not bool(settings.get("pause_sensor_enabled")):
+                return False
+            eid = str(settings.get("pause_sensor_entity") or "").strip()
+            if not eid or not eid.startswith("binary_sensor."):
+                return False
+            st = self.hass.states.get(eid)
+            s = str(st.state if st else "").lower().strip()
+            return s == "on"
+        except Exception:
+            return False
 
     def _get_data(self):
         d = self.hass.data.get(DOMAIN, {})
@@ -869,6 +896,12 @@ class AutoApplyManager:
         _s, settings = self._get_data()
         if not bool(settings.get("auto_apply_enabled")):
             return False
+        # Pause via binary sensor (indefinite while sensor is on)
+        try:
+            if self._pause_sensor_on(settings):
+                return False
+        except Exception:
+            pass
         # Pause gates
         try:
             if bool(settings.get("pause_indef")):
@@ -1349,6 +1382,55 @@ class AutoApplyManager:
         except Exception:
             self._unsub_boiler = None
 
+    def _reset_pause_sensor_watch(self) -> None:
+        if self._unsub_pause_sensor:
+            try:
+                self._unsub_pause_sensor()
+            except Exception:
+                pass
+            self._unsub_pause_sensor = None
+        _schedules, settings = self._get_data()
+        try:
+            if not bool(settings.get("pause_sensor_enabled")):
+                self._last_pause_sensor_on = None
+                return
+            eid = str(settings.get("pause_sensor_entity") or "").strip()
+            if not eid or not eid.startswith("binary_sensor."):
+                self._last_pause_sensor_on = None
+                return
+
+            # Prime last state
+            self._last_pause_sensor_on = self._pause_sensor_on(settings)
+
+            @callback
+            def _ch(event):
+                try:
+                    ns = event.data.get("new_state")
+                    s = str(ns.state if ns else "").lower().strip()
+                    now_on = s == "on"
+                except Exception:
+                    return
+                if self._last_pause_sensor_on is not None and now_on == self._last_pause_sensor_on:
+                    return
+                self._last_pause_sensor_on = now_on
+
+                async def _handle() -> None:
+                    # When pausing: just reschedule (cancels timers).
+                    # When resuming: reconcile once and schedule.
+                    if now_on:
+                        await self._schedule_next()
+                        return
+                    await self._maybe_apply_now(force=True, reconcile=True)
+                    await self._maybe_control_boiler(force=True)
+                    await self._schedule_next()
+
+                self.hass.async_create_task(_handle())
+
+            self._unsub_pause_sensor = async_track_state_change_event(self.hass, [eid], _ch)
+        except Exception:
+            self._unsub_pause_sensor = None
+            self._last_pause_sensor_on = None
+
     @staticmethod
     def _f_to_c(v: float) -> float:
         return (float(v) - 32.0) * 5.0 / 9.0
@@ -1492,6 +1574,43 @@ class AutoApplyManager:
         - Fallback to single temperature set.
         """
         try:
+            # Store contract: temperatures are canonical °C.
+            # Backwards compat: older clients may have stored °F when temp_unit == 'F'.
+            try:
+                _s, settings = self._get_data()
+            except Exception:
+                settings = {}
+
+            def _ha_is_f() -> bool:
+                try:
+                    u = self.hass.config.units.temperature_unit
+                    return u == UnitOfTemperature.FAHRENHEIT or "F" in str(u).upper()
+                except Exception:
+                    return False
+
+            ha_is_f = _ha_is_f()
+
+            def _to_ha_from_c(val_c: float) -> float:
+                return _c_to_f(val_c) if ha_is_f else float(val_c)
+
+            def _to_c_from_ha(val_ha: float) -> float:
+                return _f_to_c(val_ha) if ha_is_f else float(val_ha)
+
+            def _store_to_c(val: float) -> float:
+                v = float(val)
+                su = str((settings or {}).get("storage_temp_unit") or "").upper().strip()
+                if su == "F":
+                    return _f_to_c(v)
+                if su == "C":
+                    return v
+                # Legacy heuristic: only treat as °F when display unit is F *and* values look like °F.
+                legacy_u = str((settings or {}).get("temp_unit") or "").upper().strip()
+                if legacy_u == "F" and v > 45.0:
+                    return _f_to_c(v)
+                return v
+
+            desired_c = _store_to_c(desired)
+
             st = self.hass.states.get(eid)
             if not st:
                 return False
@@ -1501,7 +1620,8 @@ class AutoApplyManager:
                 min_v = attrs.get("min")
                 max_v = attrs.get("max")
 
-                val = float(desired)
+                # input_number min/max are in HA's unit system
+                val = float(_to_ha_from_c(desired_c))
                 try:
                     if isinstance(min_v, (int, float)):
                         val = max(val, float(min_v))
@@ -1521,15 +1641,26 @@ class AutoApplyManager:
             min_t = attrs.get("min_temp")
             max_t = attrs.get("max_temp")
 
-            def _clamp(val: float) -> float:
+            min_c = None
+            max_c = None
+            try:
+                if isinstance(min_t, (int, float)):
+                    min_c = _to_c_from_ha(float(min_t))
+                if isinstance(max_t, (int, float)):
+                    max_c = _to_c_from_ha(float(max_t))
+            except Exception:
+                min_c = None
+                max_c = None
+
+            def _clamp_c(val_c: float) -> float:
                 try:
-                    if isinstance(min_t, (int, float)):
-                        val = max(val, float(min_t))
-                    if isinstance(max_t, (int, float)):
-                        val = min(val, float(max_t))
+                    if isinstance(min_c, (int, float)):
+                        val_c = max(val_c, float(min_c))
+                    if isinstance(max_c, (int, float)):
+                        val_c = min(val_c, float(max_c))
                 except Exception:
                     pass
-                return val
+                return val_c
 
             # If preset has a manual/hold and not active, switch to it
             try:
@@ -1576,17 +1707,21 @@ class AutoApplyManager:
                 except Exception:
                     pass
                 half = max(0.2, band / 2.0)
-                low = _clamp(desired - half)
-                high = _clamp(desired + half)
-                if high <= low:
+                low_c = _clamp_c(desired_c - half)
+                high_c = _clamp_c(desired_c + half)
+                if high_c <= low_c:
                     # Ensure valid ordering
-                    high = min(_clamp(low + 0.5), _clamp(desired + 0.5))
-                data = {"entity_id": eid, "target_temp_low": float(low), "target_temp_high": float(high)}
+                    high_c = min(_clamp_c(low_c + 0.5), _clamp_c(desired_c + 0.5))
+                data = {
+                    "entity_id": eid,
+                    "target_temp_low": float(_to_ha_from_c(low_c)),
+                    "target_temp_high": float(_to_ha_from_c(high_c)),
+                }
                 await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
                 return True
 
             # Fallback: single temperature
-            data = {"entity_id": eid, "temperature": float(_clamp(desired))}
+            data = {"entity_id": eid, "temperature": float(_to_ha_from_c(_clamp_c(desired_c)))}
             await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
             return True
         except Exception:
@@ -1627,6 +1762,16 @@ class OpenWindowManager:
             # Only run when background control is active
             if not bool(settings.get("auto_apply_enabled")):
                 return False
+            # Respect pause via binary sensor
+            try:
+                if bool(settings.get("pause_sensor_enabled")):
+                    eid = str(settings.get("pause_sensor_entity") or "").strip()
+                    if eid and eid.startswith("binary_sensor."):
+                        st = self.hass.states.get(eid)
+                        if str(st.state if st else "").lower().strip() == "on":
+                            return False
+            except Exception:
+                pass
             # Respect pause gates
             if bool(settings.get("pause_indef")):
                 return False
