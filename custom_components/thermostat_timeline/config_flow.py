@@ -1,7 +1,7 @@
-from homeassistant import config_entries
+from homeassistant import config_entries  # type: ignore[reportMissingImports]
 from .const import DOMAIN
 
-class ThermostatTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class ThermostatTimelineConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):  # type: ignore[misc]
     async def async_step_user(self, user_input=None):
         # Kun én instans
         if self._async_current_entries():
