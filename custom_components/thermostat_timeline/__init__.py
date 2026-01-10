@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry  # type: ignore[reportMissi
 from homeassistant.helpers import config_validation as cv  # type: ignore[reportMissingImports]
 from homeassistant.helpers.storage import Store  # type: ignore[reportMissingImports]
 from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect  # type: ignore[reportMissingImports]
-from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event  # type: ignore[reportMissingImports]
+from homeassistant.helpers.event import async_track_point_in_utc_time, async_track_state_change_event, async_track_time_interval  # type: ignore[reportMissingImports]
 from homeassistant.util import dt as dt_util  # type: ignore[reportMissingImports]
 from datetime import timedelta
 from homeassistant.components.http import HomeAssistantView  # type: ignore[reportMissingImports]
@@ -842,6 +842,7 @@ class AutoApplyManager:
         self._unsub_timer = None
         self._unsub_persons = None
         self._unsub_boiler = None
+        self._unsub_boiler_interval = None
         self._unsub_pause_sensor = None
         self._last_pause_sensor_on: bool | None = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
@@ -860,6 +861,7 @@ class AutoApplyManager:
         # Watch person.* states if away mode is used
         self._reset_person_watch()
         self._reset_boiler_watch()
+        self._reset_boiler_interval()
         self._reset_pause_sensor_watch()
 
     async def _on_store_changed(self):
@@ -871,6 +873,7 @@ class AutoApplyManager:
         await self._schedule_next()
         self._reset_person_watch()
         self._reset_boiler_watch()
+        self._reset_boiler_interval()
         self._reset_pause_sensor_watch()
 
     def _pause_sensor_on(self, settings: dict) -> bool:
@@ -1380,6 +1383,42 @@ class AutoApplyManager:
         try:
             if not bool(settings.get("boiler_enabled")):
                 return
+            # Backwards compat: if the new schedule-driven keys are absent,
+            # keep the legacy sensor-based behavior.
+            use_schedule_mode = (
+                ("boiler_rooms" in settings)
+                or ("boiler_on_offset" in settings)
+                or ("boiler_off_offset" in settings)
+            )
+
+            if use_schedule_mode:
+                schedules, _settings = self._get_data()
+                merges = (settings.get("merges") or {}) if isinstance(settings, dict) else {}
+
+                rooms = None
+                br = settings.get("boiler_rooms")
+                if isinstance(br, list):
+                    rooms = [str(x).strip() for x in br if str(x).strip()]
+                    if len(rooms) == 0:
+                        return
+                if rooms is None:
+                    rooms = sorted(list(self._all_targets(schedules if isinstance(schedules, dict) else {}, merges)))
+
+                watch = []
+                for eid in rooms:
+                    if isinstance(eid, str) and eid.startswith("climate."):
+                        watch.append(eid)
+                if not watch:
+                    return
+
+                @callback
+                def _ch(_event):
+                    self.hass.async_create_task(self._maybe_control_boiler(force=True))
+
+                self._unsub_boiler = async_track_state_change_event(self.hass, watch, _ch)
+                return
+
+            # Legacy mode: react when boiler sensor updates
             sens = settings.get("boiler_temp_sensor")
             if not isinstance(sens, str) or not sens:
                 return
@@ -1392,6 +1431,28 @@ class AutoApplyManager:
             self._unsub_boiler = async_track_state_change_event(self.hass, [sens], _ch)
         except Exception:
             self._unsub_boiler = None
+
+    def _reset_boiler_interval(self) -> None:
+        if self._unsub_boiler_interval:
+            try:
+                self._unsub_boiler_interval()
+            except Exception:
+                pass
+            self._unsub_boiler_interval = None
+
+        _schedules, settings = self._get_data()
+        try:
+            if not bool(settings.get("boiler_enabled")):
+                return
+
+            @callback
+            def _tick(_now):
+                # Periodic sanity check (requested): independent of UI being open.
+                self.hass.async_create_task(self._maybe_control_boiler(force=True))
+
+            self._unsub_boiler_interval = async_track_time_interval(self.hass, _tick, timedelta(minutes=10))
+        except Exception:
+            self._unsub_boiler_interval = None
 
     def _reset_pause_sensor_watch(self) -> None:
         if self._unsub_pause_sensor:
@@ -1447,15 +1508,16 @@ class AutoApplyManager:
         return (float(v) - 32.0) * 5.0 / 9.0
 
     async def _maybe_control_boiler(self, force: bool = False) -> None:
-        """Control boiler switch using hysteresis based on boiler sensor.
+        """Control boiler switch.
 
-        Rules:
-        - If sensor temp < min -> switch ON
-        - If sensor temp > max -> switch OFF
-        - Otherwise do nothing
+        New (schedule-driven) mode:
+        - ON if any included room current temp is below its desired schedule temp minus boiler_on_offset.
+        - OFF when all included rooms are at/above desired schedule temp plus boiler_off_offset.
 
-        Values in settings are stored in settings.temp_unit (C/F).
-        Sensor is interpreted from unit_of_measurement when available.
+        Offsets are stored as °C deltas (independent of HA display unit).
+
+        Backwards compat:
+        - If schedule-driven keys are not present, fall back to legacy boiler sensor min/max logic.
         """
         try:
             if not self._auto_apply_enabled():
@@ -1465,9 +1527,128 @@ class AutoApplyManager:
                 return
 
             sw = settings.get("boiler_switch")
-            sens = settings.get("boiler_temp_sensor")
             if not isinstance(sw, str) or not sw.startswith("switch."):
                 return
+
+            use_schedule_mode = (
+                ("boiler_rooms" in settings)
+                or ("boiler_on_offset" in settings)
+                or ("boiler_off_offset" in settings)
+            )
+
+            # Determine current boiler state up-front (used by both modes)
+            st_sw = self.hass.states.get(sw)
+            cur = str(st_sw.state).lower().strip() if st_sw else ""
+
+            if use_schedule_mode:
+                schedules, settings = self._get_data()
+                if not isinstance(schedules, dict):
+                    return
+
+                # HA display unit for climate attributes
+                def _ha_is_f() -> bool:
+                    try:
+                        u = self.hass.config.units.temperature_unit
+                        return u == UnitOfTemperature.FAHRENHEIT or "F" in str(u).upper()
+                    except Exception:
+                        return False
+
+                ha_is_f = _ha_is_f()
+
+                def _to_c_from_ha(val_ha: float) -> float:
+                    return _f_to_c(val_ha) if ha_is_f else float(val_ha)
+
+                try:
+                    on_offset_c = float(settings.get("boiler_on_offset", 0.0) or 0.0)
+                except Exception:
+                    on_offset_c = 0.0
+                try:
+                    off_offset_c = float(settings.get("boiler_off_offset", 0.0) or 0.0)
+                except Exception:
+                    off_offset_c = 0.0
+
+                merges = settings.get("merges") or {}
+                rooms = None
+                br = settings.get("boiler_rooms")
+                if isinstance(br, list):
+                    rooms = [str(x).strip() for x in br if str(x).strip()]
+                    if len(rooms) == 0:
+                        return
+                if rooms is None:
+                    rooms = sorted(list(self._all_targets(schedules, merges if isinstance(merges, dict) else {})))
+
+                now_min = self._now_min()
+                any_below = False
+                all_above = True
+                compared = 0
+                missing = 0
+
+                for eid in rooms:
+                    try:
+                        if not (isinstance(eid, str) and eid.startswith("climate.")):
+                            missing += 1
+                            continue
+
+                        desired_c = self._desired_for(eid, schedules, settings, now_min)
+                        if desired_c is None:
+                            missing += 1
+                            continue
+
+                        st = self.hass.states.get(eid)
+                        if not st:
+                            missing += 1
+                            continue
+
+                        attrs = st.attributes or {}
+                        cur_ha = attrs.get("current_temperature")
+                        if cur_ha is None:
+                            # some devices only expose "temperature"
+                            cur_ha = attrs.get("temperature")
+                        if cur_ha is None:
+                            missing += 1
+                            continue
+                        cur_c = _to_c_from_ha(float(cur_ha))
+
+                        compared += 1
+                        if cur_c < (float(desired_c) - on_offset_c):
+                            any_below = True
+                            all_above = False
+                        elif cur_c < (float(desired_c) + off_offset_c):
+                            all_above = False
+                    except Exception:
+                        missing += 1
+                        continue
+
+                if compared <= 0:
+                    return
+
+                want = None
+                if any_below:
+                    want = "on"
+                else:
+                    # Conservative OFF: require complete data for all included rooms.
+                    if missing > 0:
+                        return
+                    if all_above:
+                        want = "off"
+                    else:
+                        return
+
+                if want == "on" and cur == "on":
+                    return
+                if want == "off" and cur == "off":
+                    return
+
+                await self.hass.services.async_call(
+                    "switch",
+                    "turn_on" if want == "on" else "turn_off",
+                    {"entity_id": sw},
+                    blocking=False,
+                )
+                return
+
+            # ---- Legacy mode (sensor min/max hysteresis) ----
+            sens = settings.get("boiler_temp_sensor")
             if not isinstance(sens, str) or "." not in sens:
                 return
 
@@ -1479,7 +1660,6 @@ class AutoApplyManager:
             except Exception:
                 return
 
-            # Read thresholds (stored in settings temp unit)
             unit = str(settings.get("temp_unit") or "C").upper()
             bmin_raw = settings.get("boiler_min_temp")
             bmax_raw = settings.get("boiler_max_temp")
@@ -1499,7 +1679,6 @@ class AutoApplyManager:
             lo = min(min_c, max_c)
             hi = max(min_c, max_c)
 
-            # Sensor value -> °C if needed
             val_c = raw
             try:
                 u = st_sens.attributes.get("unit_of_measurement")
@@ -1516,8 +1695,6 @@ class AutoApplyManager:
             else:
                 return
 
-            st_sw = self.hass.states.get(sw)
-            cur = str(st_sw.state).lower() if st_sw else ""
             if want == "on" and cur == "on":
                 return
             if want == "off" and cur == "off":
@@ -1588,9 +1765,61 @@ class AutoApplyManager:
             # Store contract: temperatures are canonical °C.
             # Backwards compat: older clients may have stored °F when temp_unit == 'F'.
             try:
-                _s, settings = self._get_data()
+                schedules, settings = self._get_data()
             except Exception:
                 settings = {}
+                schedules = {}
+
+            # Optional: for some thermostats we need to send a climate.turn_on command as well.
+            # This is configured per primary room entity (merged entities inherit the primary room setting).
+            do_turn_on = False
+            turn_on_order = "before"  # 'before' | 'after'
+            turn_on_delay_s = 1.0
+            if isinstance(eid, str) and eid.startswith("climate."):
+                try:
+                    merges = settings.get("merges") or {}
+                    primary = None
+                    if isinstance(schedules, dict) and eid in schedules:
+                        primary = eid
+                    else:
+                        for p, lst in (merges.items() if isinstance(merges, dict) else []):
+                            try:
+                                if eid in (lst or []):
+                                    primary = p
+                                    break
+                            except Exception:
+                                continue
+                    if primary is None:
+                        primary = eid
+
+                    cfg_map = settings.get("turn_on") or {}
+                    cfg = cfg_map.get(primary) if isinstance(cfg_map, dict) else None
+                    if isinstance(cfg, dict):
+                        do_turn_on = bool(cfg.get("enabled"))
+                        o = str(cfg.get("order") or "before").lower().strip()
+                        turn_on_order = "after" if o == "after" else "before"
+                    # Allow optional global delay override (seconds)
+                    try:
+                        v = float(settings.get("turn_on_delay_s", turn_on_delay_s))
+                        # Keep it short and safe
+                        turn_on_delay_s = max(0.0, min(5.0, v))
+                    except Exception:
+                        turn_on_delay_s = 1.0
+                except Exception:
+                    do_turn_on = False
+
+            async def _turn_on_and_delay() -> None:
+                if not (do_turn_on and isinstance(eid, str) and eid.startswith("climate.")):
+                    return
+                try:
+                    await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                except Exception:
+                    return
+                try:
+                    if turn_on_delay_s:
+                        await asyncio.sleep(turn_on_delay_s)
+                except Exception:
+                    return
 
             def _ha_is_f() -> bool:
                 try:
@@ -1728,12 +1957,39 @@ class AutoApplyManager:
                     "target_temp_low": float(_to_ha_from_c(low_c)),
                     "target_temp_high": float(_to_ha_from_c(high_c)),
                 }
+                if turn_on_order == "before":
+                    await _turn_on_and_delay()
                 await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+                if turn_on_order == "after":
+                    # Delay should be between set_temp and turn_on
+                    try:
+                        if turn_on_delay_s:
+                            await asyncio.sleep(turn_on_delay_s)
+                    except Exception:
+                        pass
+                    try:
+                        if do_turn_on:
+                            await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                    except Exception:
+                        pass
                 return True
 
             # Fallback: single temperature
             data = {"entity_id": eid, "temperature": float(_to_ha_from_c(_clamp_c(desired_c)))}
+            if turn_on_order == "before":
+                await _turn_on_and_delay()
             await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+            if turn_on_order == "after":
+                try:
+                    if turn_on_delay_s:
+                        await asyncio.sleep(turn_on_delay_s)
+                except Exception:
+                    pass
+                try:
+                    if do_turn_on:
+                        await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                except Exception:
+                    pass
             return True
         except Exception:
             return False
