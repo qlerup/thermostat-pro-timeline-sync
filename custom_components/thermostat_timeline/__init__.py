@@ -927,6 +927,11 @@ class AutoApplyManager:
                 return None
             pu = settings.get("pause_until_ms")
             if isinstance(pu, (int, float)) and float(pu) > 0:
+                # Ignore expired timestamps to avoid scheduling timers in the past,
+                # which can create an immediate-fire feedback loop.
+                now_ms = dt_util.utcnow().timestamp() * 1000.0
+                if float(pu) <= (now_ms + 250.0):
+                    return None
                 return dt_util.utc_from_timestamp(float(pu) / 1000.0)
         except Exception:
             pass
@@ -1362,6 +1367,18 @@ class AutoApplyManager:
         else:
             self._next_is_resume = False
             when = boundary
+
+        if not when:
+            return
+
+        # Never schedule in the past (HA will execute immediately), which can
+        # otherwise turn a stale pause_until_ms into a hot loop.
+        try:
+            now_utc = dt_util.utcnow()
+            if when <= now_utc:
+                when = now_utc + timedelta(seconds=1)
+        except Exception:
+            pass
         @callback
         def _cb(_now):
             self.hass.async_create_task(self._timer_fire())
