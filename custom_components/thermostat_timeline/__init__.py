@@ -25,6 +25,44 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 _LOGGER = logging.getLogger(__name__)
 
 
+def _norm_instance_id(raw: Any) -> str:
+    """Normalize an instance id used to namespace schedules/settings.
+
+    Must be stable, JSON-safe and reasonably human editable.
+    """
+    try:
+        s = str(raw or "").strip()
+    except Exception:
+        s = ""
+    if not s:
+        return "default"
+    # Keep a conservative charset to avoid surprises in storage keys and URLs.
+    out = []
+    for ch in s:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    s2 = "".join(out)
+    s2 = s2[:64]
+    return s2 or "default"
+
+
+def _ensure_instances_loaded(hass: HomeAssistant) -> None:
+    """Ensure hass.data[DOMAIN] has instances + active_instance_id.
+
+    This is defensive in case older installs call services before async_setup_entry finished.
+    """
+    try:
+        data = hass.data.setdefault(DOMAIN, {})
+        if not isinstance(data.get("instances"), dict):
+            data["instances"] = {"default": {"schedules": {}, "weekdays": {}, "profiles": {}, "settings": {}, "colors": {}}}
+        if not isinstance(data.get("active_instance_id"), str):
+            data["active_instance_id"] = "default"
+    except Exception:
+        pass
+
+
 def _c_to_f(c: float) -> float:
     return (float(c) * 9.0 / 5.0) + 32.0
 
@@ -57,7 +95,7 @@ def _dbg(msg: str) -> None:
         pass
 
 
-def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dict[str, Any]:
+def build_state_payload(hass: HomeAssistant, versions_only: bool = False, instance_id: str | None = None) -> dict[str, Any]:
     """Build a JSON-serializable snapshot of the current timeline state."""
     if not hass or DOMAIN not in hass.data:
         # Return safe defaults if integration not yet loaded
@@ -84,6 +122,19 @@ def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dic
             "backup": {"slots": [], "slot_index": 0, "schedules": {}, "settings": {}, "weekdays": {}, "profiles": {}, "version": 1, "last_backup_ts": None, "partial_flags": None},
         }
     data = hass.data[DOMAIN]
+    _ensure_instances_loaded(hass)
+    instances = data.get("instances") if isinstance(data.get("instances"), dict) else {}
+    active_iid = _norm_instance_id(data.get("active_instance_id") or "default")
+    if active_iid not in instances and instances:
+        # Pick first available instance if active id is missing.
+        try:
+            active_iid = sorted(instances.keys())[0]
+        except Exception:
+            active_iid = "default"
+    req_iid = _norm_instance_id(instance_id) if instance_id else active_iid
+    if req_iid not in instances and instances:
+        req_iid = active_iid
+    inst = instances.get(req_iid, {}) if isinstance(instances.get(req_iid), dict) else {}
     payload: dict[str, Any] = {
         "version": int(data.get("version", 1)),
         "settings_version": int(data.get("settings_version", data.get("version", 1))),
@@ -91,15 +142,19 @@ def build_state_payload(hass: HomeAssistant, versions_only: bool = False) -> dic
         "weekday_version": int(data.get("weekday_version", data.get("version", 1))),
         "profile_version": int(data.get("profile_version", data.get("version", 1))),
         "backup_version": int(data.get("backup_version", 1)),
+        "active_instance_id": active_iid,
+        "instance_id": req_iid,
+        "instances": sorted(list(instances.keys())) if isinstance(instances, dict) else ["default"],
     }
     if versions_only:
         return payload
     payload.update({
-        "schedules": data.get("schedules", {}),
-        "weekdays": data.get("weekday_schedules", {}),
-        "profiles": data.get("profile_schedules", {}),
-        "settings": data.get("settings", {}),
-        "colors": data.get("colors", {}),
+        # Return data for the requested instance (or the active instance when not specified).
+        "schedules": inst.get("schedules", {}) if isinstance(inst, dict) else data.get("schedules", {}),
+        "weekdays": inst.get("weekdays", {}) if isinstance(inst, dict) else data.get("weekday_schedules", {}),
+        "profiles": inst.get("profiles", {}) if isinstance(inst, dict) else data.get("profile_schedules", {}),
+        "settings": inst.get("settings", {}) if isinstance(inst, dict) else data.get("settings", {}),
+        "colors": inst.get("colors", {}) if isinstance(inst, dict) else data.get("colors", {}),
         "backup": {
             "slots": data.get("backup_slots", []),
             "slot_index": data.get("backup_slot_index", 0),
@@ -126,7 +181,12 @@ class ThermostatTimelineStateView(HomeAssistantView):
     async def get(self, request):
         try:
             _dbg("API /state requested")
-            payload = build_state_payload(self.hass, versions_only=False)
+            iid = None
+            try:
+                iid = request.query.get("instance_id")
+            except Exception:
+                iid = None
+            payload = build_state_payload(self.hass, versions_only=False, instance_id=iid)
             _LOGGER.debug("API /state requested, version=%s", payload.get("version"))
             _dbg(f"API /state returning version={payload.get('version')}")
             return self.json(payload)
@@ -177,11 +237,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
-    hass.data[DOMAIN]["schedules"] = data.get("schedules", {})
-    hass.data[DOMAIN]["weekday_schedules"] = data.get("weekdays", {}) or {}
-    hass.data[DOMAIN]["profile_schedules"] = data.get("profiles", {}) or {}
-    hass.data[DOMAIN]["settings"] = data.get("settings", {})
-    hass.data[DOMAIN]["colors"] = data.get("colors", {}) or {}
+
+    # --- Multi-instance store support (backwards compatible) ---
+    instances: dict[str, Any] = {}
+    active_iid = _norm_instance_id(data.get("active_instance_id") or data.get("active_instance") or "default")
+    raw_instances = data.get("instances")
+    if isinstance(raw_instances, dict):
+        for k, v in raw_instances.items():
+            if not isinstance(v, dict):
+                continue
+            iid = _norm_instance_id(k)
+            instances[iid] = {
+                "schedules": v.get("schedules", {}) if isinstance(v.get("schedules"), dict) else {},
+                "weekdays": v.get("weekdays", {}) if isinstance(v.get("weekdays"), dict) else {},
+                "profiles": v.get("profiles", {}) if isinstance(v.get("profiles"), dict) else {},
+                "settings": v.get("settings", {}) if isinstance(v.get("settings"), dict) else {},
+                "colors": v.get("colors", {}) if isinstance(v.get("colors"), dict) else {},
+            }
+    if not instances:
+        # Legacy flat format: migrate into default instance.
+        instances = {
+            "default": {
+                "schedules": data.get("schedules", {}) if isinstance(data.get("schedules"), dict) else {},
+                "weekdays": data.get("weekdays", {}) if isinstance(data.get("weekdays"), dict) else {},
+                "profiles": data.get("profiles", {}) if isinstance(data.get("profiles"), dict) else {},
+                "settings": data.get("settings", {}) if isinstance(data.get("settings"), dict) else {},
+                "colors": data.get("colors", {}) if isinstance(data.get("colors"), dict) else {},
+            }
+        }
+        active_iid = "default"
+    if active_iid not in instances:
+        try:
+            active_iid = sorted(instances.keys())[0]
+        except Exception:
+            active_iid = "default"
+
+    hass.data[DOMAIN]["instances"] = instances
+    hass.data[DOMAIN]["active_instance_id"] = active_iid
+
+    # Keep legacy top-level keys pointing at the active instance for minimal change elsewhere.
+    active_store = instances.get(active_iid, {}) if isinstance(instances.get(active_iid), dict) else {}
+    hass.data[DOMAIN]["schedules"] = active_store.get("schedules", {})
+    hass.data[DOMAIN]["weekday_schedules"] = active_store.get("weekdays", {}) or {}
+    hass.data[DOMAIN]["profile_schedules"] = active_store.get("profiles", {}) or {}
+    hass.data[DOMAIN]["settings"] = active_store.get("settings", {})
+    hass.data[DOMAIN]["colors"] = active_store.get("colors", {}) or {}
     hass.data[DOMAIN]["version"] = int(data.get("version", 1))
     # Track a separate version for settings-only changes (for the new settings sensor)
     hass.data[DOMAIN]["settings_version"] = int(data.get("settings_version", data.get("version", 1)))
@@ -219,12 +319,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # Broadcast first so UI updates immediately
         async_dispatcher_send(hass, SIGNAL_UPDATED)
         try:
+            _ensure_instances_loaded(hass)
+            instances = hass.data[DOMAIN].get("instances", {})
+            active_iid = _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default")
+            active_store = instances.get(active_iid, {}) if isinstance(instances, dict) else {}
             await store.async_save({
-                "schedules": hass.data[DOMAIN]["schedules"],
-                "weekdays": hass.data[DOMAIN].get("weekday_schedules", {}),
-                "profiles": hass.data[DOMAIN].get("profile_schedules", {}),
-                "settings": hass.data[DOMAIN].get("settings", {}),
-                "colors": hass.data[DOMAIN].get("colors", {}),
+                # New multi-instance store
+                "instances": instances,
+                "active_instance_id": active_iid,
+                # Legacy top-level mirror (active instance)
+                "schedules": active_store.get("schedules", hass.data[DOMAIN].get("schedules", {})),
+                "weekdays": active_store.get("weekdays", hass.data[DOMAIN].get("weekday_schedules", {})),
+                "profiles": active_store.get("profiles", hass.data[DOMAIN].get("profile_schedules", {})),
+                "settings": active_store.get("settings", hass.data[DOMAIN].get("settings", {})),
+                "colors": active_store.get("colors", hass.data[DOMAIN].get("colors", {})),
                 "version": hass.data[DOMAIN]["version"],
                 "settings_version": hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN]["version"]),
                 "colors_version": hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"]),
@@ -280,11 +388,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def set_store(call: ServiceCall):
         force = bool(call.data.get("force"))
-        cur_sched = hass.data[DOMAIN].get("schedules", {})
-        cur_set = hass.data[DOMAIN].get("settings", {})
-        cur_colors = hass.data[DOMAIN].get("colors", {})
-        cur_week = hass.data[DOMAIN].get("weekday_schedules", {})
-        cur_prof = hass.data[DOMAIN].get("profile_schedules", {})
+        _ensure_instances_loaded(hass)
+        instances = hass.data[DOMAIN].setdefault("instances", {})
+        iid_in_call = "instance_id" in call.data
+        iid = _norm_instance_id(call.data.get("instance_id")) if iid_in_call else _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default")
+
+        inst = instances.get(iid)
+        if not isinstance(inst, dict):
+            inst = {"schedules": {}, "weekdays": {}, "profiles": {}, "settings": {}, "colors": {}}
+            instances[iid] = inst
+
+        cur_sched = inst.get("schedules", {}) if isinstance(inst.get("schedules"), dict) else {}
+        cur_set = inst.get("settings", {}) if isinstance(inst.get("settings"), dict) else {}
+        cur_colors = inst.get("colors", {}) if isinstance(inst.get("colors"), dict) else {}
+        cur_week = inst.get("weekdays", {}) if isinstance(inst.get("weekdays"), dict) else {}
+        cur_prof = inst.get("profiles", {}) if isinstance(inst.get("profiles"), dict) else {}
         changed = False
         sched_changed = False
         settings_changed = False
@@ -292,13 +410,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         weekday_changed = False
         profile_changed = False
 
+        prev_active = _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default")
+        activate = False
+        if "activate" in call.data:
+            activate = bool(call.data.get("activate"))
+        elif iid_in_call:
+            # New clients that pass instance_id will default to activating that instance.
+            activate = True
+
         if "schedules" in call.data:
             schedules = call.data.get("schedules")
             if not isinstance(schedules, dict):
                 _LOGGER.warning("%s.set_store: schedules must be an object when provided", DOMAIN)
                 return
             if force or schedules != cur_sched:
-                hass.data[DOMAIN]["schedules"] = schedules
+                inst["schedules"] = schedules
                 sched_changed = True
                 changed = True
             if "weekdays" not in call.data:
@@ -315,7 +441,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         if wk:
                             new_week[eid] = wk
                     if force or new_week != cur_week:
-                        hass.data[DOMAIN]["weekday_schedules"] = new_week
+                        inst["weekdays"] = new_week
                         weekday_changed = True
                         changed = True
                 except Exception:
@@ -334,7 +460,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         if pr:
                             new_prof[eid] = pr
                     if force or new_prof != cur_prof:
-                        hass.data[DOMAIN]["profile_schedules"] = new_prof
+                        inst["profiles"] = new_prof
                         profile_changed = True
                         changed = True
                 except Exception:
@@ -344,13 +470,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             settings = call.data.get("settings")
             if isinstance(settings, dict):
                 if force or settings != cur_set:
-                    hass.data[DOMAIN]["settings"] = settings
+                    inst["settings"] = settings
                     settings_changed = True
                     changed = True
                 c_ranges = settings.get("color_ranges")
                 c_global = settings.get("color_global")
                 if c_ranges is not None or c_global is not None:
-                    hass.data[DOMAIN]["colors"] = {
+                    inst["colors"] = {
                         "color_ranges": c_ranges if c_ranges is not None else cur_colors.get("color_ranges", {}),
                         "color_global": c_global if c_global is not None else cur_colors.get("color_global", False),
                     }
@@ -362,7 +488,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             colors = call.data.get("colors")
             if isinstance(colors, dict):
                 if force or colors != cur_colors:
-                    hass.data[DOMAIN]["colors"] = colors
+                    inst["colors"] = colors
                     colors_changed = True
                     changed = True
 
@@ -370,19 +496,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             weekdays = call.data.get("weekdays")
             if isinstance(weekdays, dict):
                 if force or weekdays != cur_week:
-                    hass.data[DOMAIN]["weekday_schedules"] = weekdays
+                    inst["weekdays"] = weekdays
                     weekday_changed = True
                     changed = True
                 try:
                     for eid, wk in (weekdays.items() if isinstance(weekdays, dict) else []):
                         if not isinstance(wk, dict):
                             continue
-                        row = dict(hass.data[DOMAIN].get("schedules", {}).get(eid, {}))
+                        row = dict(inst.get("schedules", {}).get(eid, {}))
                         if "weekly" in wk:
                             row["weekly"] = wk["weekly"]
                         if "weekly_modes" in wk:
                             row["weekly_modes"] = wk["weekly_modes"]
-                        hass.data[DOMAIN].setdefault("schedules", {})[eid] = row
+                        inst.setdefault("schedules", {})[eid] = row
                         sched_changed = True
                 except Exception:
                     pass
@@ -391,25 +517,37 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             profiles = call.data.get("profiles")
             if isinstance(profiles, dict):
                 if force or profiles != cur_prof:
-                    hass.data[DOMAIN]["profile_schedules"] = profiles
+                    inst["profiles"] = profiles
                     profile_changed = True
                     changed = True
                 try:
                     for eid, pdata in (profiles.items() if isinstance(profiles, dict) else []):
                         if not isinstance(pdata, dict):
                             continue
-                        row = dict(hass.data[DOMAIN].get("schedules", {}).get(eid, {}))
+                        row = dict(inst.get("schedules", {}).get(eid, {}))
                         if "profiles" in pdata:
                             row["profiles"] = pdata["profiles"]
                         if "activeProfile" in pdata:
                             row["activeProfile"] = pdata["activeProfile"]
-                        hass.data[DOMAIN].setdefault("schedules", {})[eid] = row
+                        inst.setdefault("schedules", {})[eid] = row
                         sched_changed = True
                 except Exception:
                     pass
 
-        if not changed and not force:
+        # Allow activation-only switches (no payload changes).
+        if not changed and not force and not (activate and prev_active != iid):
             return
+
+        # Handle activation and keep legacy pointers synced.
+        if activate:
+            hass.data[DOMAIN]["active_instance_id"] = iid
+
+        if activate or _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default") == iid:
+            hass.data[DOMAIN]["schedules"] = inst.get("schedules", {})
+            hass.data[DOMAIN]["weekday_schedules"] = inst.get("weekdays", {})
+            hass.data[DOMAIN]["profile_schedules"] = inst.get("profiles", {})
+            hass.data[DOMAIN]["settings"] = inst.get("settings", {})
+            hass.data[DOMAIN]["colors"] = inst.get("colors", {})
 
         if sched_changed:
             hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
@@ -435,12 +573,83 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"])) + 1
             hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
             hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
+
+        # Switching active instance should also trigger a refresh.
+        if activate and prev_active != iid:
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN]["version"]) + 1
         _LOGGER.info("set_store: version=%s, sched_changed=%s, settings_changed=%s", 
                      hass.data[DOMAIN]["version"], sched_changed, settings_changed)
         await _save_and_broadcast()
 
+    async def select_instance(call: ServiceCall):
+        """Select the active instance id.
+
+        Optional: create the instance if missing, and optionally copy from current active.
+        """
+        _ensure_instances_loaded(hass)
+        instances = hass.data[DOMAIN].setdefault("instances", {})
+        target = _norm_instance_id(call.data.get("instance_id"))
+        create_if_missing = bool(call.data.get("create_if_missing"))
+        copy_from_active = bool(call.data.get("copy_from_active"))
+        prev_active = _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default")
+
+        if target not in instances:
+            if not create_if_missing:
+                _LOGGER.warning("%s.select_instance: instance_id '%s' does not exist", DOMAIN, target)
+                return
+            base = {}
+            if copy_from_active and prev_active in instances and isinstance(instances.get(prev_active), dict):
+                base = instances.get(prev_active) or {}
+            instances[target] = {
+                "schedules": (base.get("schedules") or {}) if isinstance(base, dict) else {},
+                "weekdays": (base.get("weekdays") or {}) if isinstance(base, dict) else {},
+                "profiles": (base.get("profiles") or {}) if isinstance(base, dict) else {},
+                "settings": (base.get("settings") or {}) if isinstance(base, dict) else {},
+                "colors": (base.get("colors") or {}) if isinstance(base, dict) else {},
+            }
+
+        hass.data[DOMAIN]["active_instance_id"] = target
+        inst = instances.get(target, {}) if isinstance(instances.get(target), dict) else {}
+        hass.data[DOMAIN]["schedules"] = inst.get("schedules", {})
+        hass.data[DOMAIN]["weekday_schedules"] = inst.get("weekdays", {})
+        hass.data[DOMAIN]["profile_schedules"] = inst.get("profiles", {})
+        hass.data[DOMAIN]["settings"] = inst.get("settings", {})
+        hass.data[DOMAIN]["colors"] = inst.get("colors", {})
+
+        if prev_active != target:
+            hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 0)) + 1
+        await _save_and_broadcast()
+
+    async def rename_instance(call: ServiceCall):
+        """Rename an instance id (move data)."""
+        _ensure_instances_loaded(hass)
+        instances = hass.data[DOMAIN].setdefault("instances", {})
+        old_id = _norm_instance_id(call.data.get("old_instance_id") or call.data.get("old_id"))
+        new_id = _norm_instance_id(call.data.get("new_instance_id") or call.data.get("new_id"))
+        if old_id == new_id:
+            return
+        if old_id not in instances:
+            _LOGGER.warning("%s.rename_instance: old instance '%s' not found", DOMAIN, old_id)
+            return
+        if new_id in instances:
+            _LOGGER.warning("%s.rename_instance: new instance '%s' already exists", DOMAIN, new_id)
+            return
+        instances[new_id] = instances.pop(old_id)
+        if _norm_instance_id(hass.data[DOMAIN].get("active_instance_id") or "default") == old_id:
+            hass.data[DOMAIN]["active_instance_id"] = new_id
+            inst = instances.get(new_id, {}) if isinstance(instances.get(new_id), dict) else {}
+            hass.data[DOMAIN]["schedules"] = inst.get("schedules", {})
+            hass.data[DOMAIN]["weekday_schedules"] = inst.get("weekdays", {})
+            hass.data[DOMAIN]["profile_schedules"] = inst.get("profiles", {})
+            hass.data[DOMAIN]["settings"] = inst.get("settings", {})
+            hass.data[DOMAIN]["colors"] = inst.get("colors", {})
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 0)) + 1
+        await _save_and_broadcast()
+
     async def clear_store(call: ServiceCall):
-        # Explicit clear: wipe schedules + settings and bump both versions once
+        # Explicit clear: wipe ALL instances + active and bump versions.
+        hass.data[DOMAIN]["instances"] = {"default": {"schedules": {}, "weekdays": {}, "profiles": {}, "settings": {}, "colors": {}}}
+        hass.data[DOMAIN]["active_instance_id"] = "default"
         hass.data[DOMAIN]["schedules"] = {}
         hass.data[DOMAIN]["weekday_schedules"] = {}
         hass.data[DOMAIN]["profile_schedules"] = {}
@@ -452,6 +661,51 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
         hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
         await _save_and_broadcast()
+
+    async def factory_reset(call: ServiceCall):
+        """Factory reset thermostat_timeline.
+
+        Deletes the underlying .storage JSON files and recreates them empty.
+        This is useful when the store has become corrupted or needs a hard reset.
+        """
+        # 1) Remove persisted files (best-effort)
+        try:
+            await store.async_remove()
+        except Exception:
+            pass
+        try:
+            await backup_store.async_remove()
+        except Exception:
+            pass
+
+        # 2) Reset runtime state (equivalent to clear_store + clearing backups)
+        hass.data[DOMAIN]["instances"] = {"default": {"schedules": {}, "weekdays": {}, "profiles": {}, "settings": {}, "colors": {}}}
+        hass.data[DOMAIN]["active_instance_id"] = "default"
+        hass.data[DOMAIN]["schedules"] = {}
+        hass.data[DOMAIN]["weekday_schedules"] = {}
+        hass.data[DOMAIN]["profile_schedules"] = {}
+        hass.data[DOMAIN]["settings"] = {}
+        hass.data[DOMAIN]["colors"] = {}
+        hass.data[DOMAIN]["version"] = int(hass.data[DOMAIN].get("version", 0)) + 1
+        hass.data[DOMAIN]["settings_version"] = int(hass.data[DOMAIN].get("settings_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["colors_version"] = int(hass.data[DOMAIN].get("colors_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["weekday_version"] = int(hass.data[DOMAIN].get("weekday_version", hass.data[DOMAIN]["version"])) + 1
+        hass.data[DOMAIN]["profile_version"] = int(hass.data[DOMAIN].get("profile_version", hass.data[DOMAIN]["version"])) + 1
+
+        # Clear backups too
+        hass.data[DOMAIN]["backup_schedules"] = {}
+        hass.data[DOMAIN]["backup_settings"] = {}
+        hass.data[DOMAIN]["backup_weekdays"] = {}
+        hass.data[DOMAIN]["backup_profiles"] = {}
+        hass.data[DOMAIN]["backup_partial_flags"] = None
+        hass.data[DOMAIN]["backup_slot_index"] = 0
+        hass.data[DOMAIN]["backup_last_ts"] = None
+        hass.data[DOMAIN]["backup_slots"] = []
+        hass.data[DOMAIN]["backup_version"] = int(hass.data[DOMAIN].get("backup_version", 1)) + 1
+
+        # 3) Recreate empty files and broadcast
+        await _save_and_broadcast()
+        await _save_backup()
 
     async def backup_now(call: ServiceCall):
         """Create a backup of the current store.
@@ -804,6 +1058,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.services.async_register(DOMAIN, "set_store", set_store)
     hass.services.async_register(DOMAIN, "clear_store", clear_store)
+    hass.services.async_register(DOMAIN, "factory_reset", factory_reset)
+    hass.services.async_register(DOMAIN, "select_instance", select_instance)
+    hass.services.async_register(DOMAIN, "rename_instance", rename_instance)
     hass.services.async_register(DOMAIN, "backup_now", backup_now)
     hass.services.async_register(DOMAIN, "delete_backup", delete_backup)
     hass.services.async_register(DOMAIN, "restore_now", restore_now)
@@ -818,14 +1075,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except Exception:
         _LOGGER.warning("%s: failed to register HTTP views", DOMAIN)
 
-    # ---- Background Auto-Apply Manager ----
-    mgr = AutoApplyManager(hass)
+    # ---- Background Auto-Apply Manager (multi-instance) ----
+    mgr = MultiInstanceAutoApplyManager(hass)
     hass.data[DOMAIN]["manager"] = mgr
-    # ---- Open Window Detection (background) ----
-    owd = OpenWindowManager(hass, apply_mgr=mgr)
+    await mgr.async_start()
+    # ---- Open Window Detection (background, multi-instance) ----
+    owd = MultiInstanceOpenWindowManager(hass, apply_multi=mgr)
+    # Keep legacy key for compatibility (points to the multi wrapper).
     hass.data[DOMAIN]["open_window_manager"] = owd
     await owd.async_start()
-    await mgr.async_start()
     # ---- Backup Manager (auto backup) ----
     bkm = BackupManager(hass, backup_cb=backup_now)
     hass.data[DOMAIN]["backup_manager"] = bkm
@@ -837,8 +1095,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 class AutoApplyManager:
-    def __init__(self, hass: HomeAssistant):
+    def __init__(self, hass: HomeAssistant, instance_id: str = "default"):
         self.hass = hass
+        self._instance_id = _norm_instance_id(instance_id)
         self._unsub_timer = None
         self._unsub_persons = None
         self._unsub_boiler = None
@@ -892,9 +1151,33 @@ class AutoApplyManager:
 
     def _get_data(self):
         d = self.hass.data.get(DOMAIN, {})
+        try:
+            instances = d.get("instances") if isinstance(d.get("instances"), dict) else None
+            if isinstance(instances, dict):
+                inst = instances.get(self._instance_id)
+                if isinstance(inst, dict):
+                    schedules = inst.get("schedules", {}) if isinstance(inst.get("schedules"), dict) else {}
+                    settings = inst.get("settings", {}) if isinstance(inst.get("settings"), dict) else {}
+                    return schedules, settings
+        except Exception:
+            pass
+        # Fallback to legacy active-instance pointers
         schedules = d.get("schedules", {})
         settings = d.get("settings", {})
         return schedules, settings
+
+    def _owd_mgr(self):
+        """Return the Open Window manager for this instance (if any)."""
+        try:
+            d = self.hass.data.get(DOMAIN, {})
+            m = d.get("open_window_managers")
+            if isinstance(m, dict):
+                owd = m.get(self._instance_id)
+                if owd is not None:
+                    return owd
+            return d.get("open_window_manager")
+        except Exception:
+            return None
 
     def _auto_apply_enabled(self) -> bool:
         _s, settings = self._get_data()
@@ -1197,7 +1480,7 @@ class AutoApplyManager:
                 continue
             # Open Window Detection: skip applying schedules while a room is suspended
             try:
-                owd = self.hass.data.get(DOMAIN, {}).get("open_window_manager")
+                owd = self._owd_mgr()
                 if owd and hasattr(owd, "is_entity_suspended") and owd.is_entity_suspended(eid):
                     continue
             except Exception:
@@ -1282,7 +1565,7 @@ class AutoApplyManager:
                 return
             # Respect Open Window Detection suspension
             try:
-                owd = self.hass.data.get(DOMAIN, {}).get("open_window_manager")
+                owd = self._owd_mgr()
                 if owd and hasattr(owd, "is_entity_suspended") and owd.is_entity_suspended(eid):
                     return
             except Exception:
@@ -1372,11 +1655,16 @@ class AutoApplyManager:
             return
 
         # Never schedule in the past (HA will execute immediately), which can
-        # otherwise turn a stale pause_until_ms into a hot loop.
+        # otherwise turn stale timestamps into a hot loop. Timers are minute-
+        # granularity here, so clamp to at least +1 minute.
+        try:
+            when = dt_util.as_utc(when)
+        except Exception:
+            pass
         try:
             now_utc = dt_util.utcnow()
             if when <= now_utc:
-                when = now_utc + timedelta(seconds=1)
+                when = now_utc + timedelta(minutes=1)
         except Exception:
             pass
         @callback
@@ -1525,7 +1813,7 @@ class AutoApplyManager:
         return (float(v) - 32.0) * 5.0 / 9.0
 
     async def _maybe_control_boiler(self, force: bool = False) -> None:
-        """Control boiler switch.
+        """Control boiler switch (switch.* or input_boolean.*).
 
         New (schedule-driven) mode:
         - ON if any included room current temp is below its desired schedule temp minus boiler_on_offset.
@@ -1544,7 +1832,10 @@ class AutoApplyManager:
                 return
 
             sw = settings.get("boiler_switch")
-            if not isinstance(sw, str) or not sw.startswith("switch."):
+            if not isinstance(sw, str) or "." not in sw:
+                return
+            sw_domain = sw.split(".", 1)[0]
+            if sw_domain not in ("switch", "input_boolean"):
                 return
 
             use_schedule_mode = (
@@ -1657,7 +1948,7 @@ class AutoApplyManager:
                     return
 
                 await self.hass.services.async_call(
-                    "switch",
+                    sw_domain,
                     "turn_on" if want == "on" else "turn_off",
                     {"entity_id": sw},
                     blocking=False,
@@ -1718,7 +2009,7 @@ class AutoApplyManager:
                 return
 
             await self.hass.services.async_call(
-                "switch",
+                sw_domain,
                 "turn_on" if want == "on" else "turn_off",
                 {"entity_id": sw},
                 blocking=False,
@@ -2012,15 +2303,112 @@ class AutoApplyManager:
             return False
 
 
+class MultiInstanceAutoApplyManager:
+    """Run auto-apply/boiler control for all known instance_id namespaces.
+
+    This makes the card's "Configuration ID" feature work fully in the background:
+    each instance gets its own timers/watchers and runs independently.
+    """
+
+    def __init__(self, hass: HomeAssistant):
+        self.hass = hass
+        self._managers: dict[str, AutoApplyManager] = {}
+        self._unsub = None
+
+    def get(self, instance_id: str) -> AutoApplyManager | None:
+        try:
+            return self._managers.get(_norm_instance_id(instance_id))
+        except Exception:
+            return None
+
+    async def async_start(self) -> None:
+        await self._sync()
+
+        @callback
+        def _on_update():
+            # New instances can appear via set_store; ensure they get background managers.
+            self.hass.async_create_task(self._sync())
+
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
+
+    async def _sync(self) -> None:
+        try:
+            _ensure_instances_loaded(self.hass)
+            d = self.hass.data.get(DOMAIN, {})
+            instances = d.get("instances") if isinstance(d.get("instances"), dict) else {}
+            for iid in (instances.keys() if isinstance(instances, dict) else []):
+                try:
+                    iidn = _norm_instance_id(iid)
+                    if iidn in self._managers:
+                        continue
+                    mgr = AutoApplyManager(self.hass, instance_id=iidn)
+                    self._managers[iidn] = mgr
+                    await mgr.async_start()
+                except Exception:
+                    continue
+            # Expose for other components
+            d["instance_managers"] = self._managers
+        except Exception:
+            return
+
+
+class MultiInstanceOpenWindowManager:
+    """Run Open Window Detection independently per instance."""
+
+    def __init__(self, hass: HomeAssistant, apply_multi: MultiInstanceAutoApplyManager):
+        self.hass = hass
+        self._apply_multi = apply_multi
+        self._managers: dict[str, OpenWindowManager] = {}
+        self._unsub = None
+
+    def get(self, instance_id: str) -> 'OpenWindowManager' | None:
+        try:
+            return self._managers.get(_norm_instance_id(instance_id))
+        except Exception:
+            return None
+
+    async def async_start(self) -> None:
+        await self._sync()
+
+        @callback
+        def _on_update():
+            self.hass.async_create_task(self._sync())
+
+        async_dispatcher_connect(self.hass, SIGNAL_UPDATED, _on_update)
+
+    async def _sync(self) -> None:
+        try:
+            _ensure_instances_loaded(self.hass)
+            d = self.hass.data.get(DOMAIN, {})
+            instances = d.get("instances") if isinstance(d.get("instances"), dict) else {}
+            for iid in (instances.keys() if isinstance(instances, dict) else []):
+                try:
+                    iidn = _norm_instance_id(iid)
+                    if iidn in self._managers:
+                        continue
+                    mgr = self._apply_multi.get(iidn)
+                    if not mgr:
+                        continue
+                    owd = OpenWindowManager(self.hass, apply_mgr=mgr, instance_id=iidn)
+                    self._managers[iidn] = owd
+                    await owd.async_start()
+                except Exception:
+                    continue
+            d["open_window_managers"] = self._managers
+        except Exception:
+            return
+
+
 class OpenWindowManager:
     """Background Open Window Detection.
 
     Uses settings.open_window from the shared store.
     """
 
-    def __init__(self, hass: HomeAssistant, apply_mgr: AutoApplyManager):
+    def __init__(self, hass: HomeAssistant, apply_mgr: AutoApplyManager, instance_id: str = "default"):
         self.hass = hass
         self._mgr = apply_mgr
+        self._instance_id = _norm_instance_id(instance_id)
         self._unsub = None
         self._room_sensors: dict[str, list[str]] = {}
         self._open_delay_s: int = 0
@@ -2035,6 +2423,17 @@ class OpenWindowManager:
             return False
 
     def _settings(self) -> dict:
+        try:
+            d = self.hass.data.get(DOMAIN, {}) or {}
+            insts = d.get("instances") if isinstance(d.get("instances"), dict) else None
+            if isinstance(insts, dict):
+                inst = insts.get(self._instance_id)
+                if isinstance(inst, dict):
+                    s = inst.get("settings")
+                    if isinstance(s, dict):
+                        return s
+        except Exception:
+            pass
         return (self.hass.data.get(DOMAIN, {}) or {}).get("settings", {}) or {}
 
     def _enabled(self, settings: dict | None = None) -> bool:
