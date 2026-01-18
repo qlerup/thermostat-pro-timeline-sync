@@ -1,6 +1,6 @@
 {
   "domain": "thermostat_timeline",
-  "name": "Thermostat Pro Timeline Sync Test",
+  "name": "Thermostat Pro Timeline Sync",
   "codeowners": ["@qlerup"],
   "config_flow": true,
   "dependencies": ["http"],
