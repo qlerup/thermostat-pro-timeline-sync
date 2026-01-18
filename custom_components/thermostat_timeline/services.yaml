@@ -2,6 +2,19 @@ set_store:
   name: Set full store
   description: Replace the entire schedules store and bump version.
   fields:
+    instance_id:
+      name: Instance ID
+      description: Optional. When provided, writes into that instance (and activates it by default).
+      required: false
+      example: default
+      selector:
+        text: {}
+    activate:
+      name: Activate instance
+      description: Optional. When instance_id is provided, whether to make it the active instance. Defaults to true.
+      required: false
+      selector:
+        boolean: {}
     schedules:
       name: Schedules
       description: Object mapping entity_id -> {defaultTemp, blocks:[...]}.
@@ -18,6 +31,46 @@ set_store:
         {"min_temp":5,"max_temp":25,"away":{"enabled":true,"persons":["person.me"],"target_c":17},"merges":{"climate.living":["climate.living_2"]},"auto_apply_enabled":true}
       selector:
         object: {}
+
+select_instance:
+  name: Select active instance
+  description: Switch which instance is used for background control and default API /state.
+  fields:
+    instance_id:
+      name: Instance ID
+      required: true
+      example: winter
+      selector:
+        text: {}
+    create_if_missing:
+      name: Create if missing
+      description: Create the instance if it does not exist.
+      required: false
+      selector:
+        boolean: {}
+    copy_from_active:
+      name: Copy from current active
+      description: When creating, copy schedules/settings from current active instance.
+      required: false
+      selector:
+        boolean: {}
+
+rename_instance:
+  name: Rename instance
+  description: Rename an instance id (moves all data).
+  fields:
+    old_instance_id:
+      name: Old instance ID
+      required: true
+      example: old_name
+      selector:
+        text: {}
+    new_instance_id:
+      name: New instance ID
+      required: true
+      example: new_name
+      selector:
+        text: {}
 
 patch_entity:
   name: Patch single entity
@@ -43,6 +96,10 @@ patch_entity:
 clear:
   name: Clear store
   description: Clear all schedules and bump version.
+
+factory_reset:
+  name: Factory reset
+  description: Delete thermostat_timeline storage files and recreate them empty (removes all instances, schedules, settings, and backups).
 
 backup_now:
   name: Backup now
