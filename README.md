@@ -1,4 +1,4 @@
-# Thermostat Pro Timeline Sync
+# Thermostat Pro Timeline
 
 [![hacs\_badge](https://img.shields.io/badge/HACS-Default-blue.svg)](https://hacs.xyz) [![Downloads](https://img.shields.io/github/downloads/qlerup/thermostat-pro-timeline-sync/total)](https://github.com/qlerup/thermostat-pro-timeline-sync/releases)
 
