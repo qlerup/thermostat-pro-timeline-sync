@@ -238,6 +238,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN]["store"] = store
 
+    # Ensure Lovelace card JS is available and resource is registered (best-effort)
+    try:
+        from .frontend import ensure_frontend
+        await ensure_frontend(hass)
+    except Exception:
+        _LOGGER.debug("%s: ensure_frontend failed", DOMAIN, exc_info=True)
+
     # --- Multi-instance store support (backwards compatible) ---
     instances: dict[str, Any] = {}
     active_iid = _norm_instance_id(data.get("active_instance_id") or data.get("active_instance") or "default")
