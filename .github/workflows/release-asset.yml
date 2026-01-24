@@ -13,19 +13,20 @@ jobs:
     env:
       INTEGRATION: thermostat_timeline
       HACS_ZIP: thermostat-pro-timeline-sync.zip
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Verify required files exist
         run: |
-          test -f custom_components/${{ env.INTEGRATION }}/manifest.json
-          test -f hacs.json
+          test -f "custom_components/${{ env.INTEGRATION }}/manifest.json"
+          test -f "hacs.json"
+          test -f "thermostat-pro-timeline.js"
 
       - name: Extract version from tag
         id: ver
         run: |
           TAG="${{ github.event.release.tag_name }}"
-          # strip leading "v" if present
           VER="${TAG#v}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
@@ -36,14 +37,23 @@ jobs:
             > manifest.tmp
           mv manifest.tmp "custom_components/${{ env.INTEGRATION }}/manifest.json"
 
-      - name: Build ZIP for release (HACS only)
+      - name: Build ZIP for release (integration in ZIP root + www folder)
         run: |
           mkdir -p dist
-          BASENAME="${{ env.HACS_ZIP }}"
-          # Skift til integrationsmappen for at undgå ekstra "custom_components" i ZIP
-          cd custom_components/${{ env.INTEGRATION }}
-          zip -r "../../dist/${BASENAME}" . \
-            -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*"
+          STAGE="dist/stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+
+          # 1) Læg integrationens INDHOLD i ZIP-roden (ingen custom_components mappe i ZIP'en)
+          cp -a "custom_components/${{ env.INTEGRATION }}/." "$STAGE/"
+
+          # 2) Tilføj www/ og JS filen fra repo-roden
+          mkdir -p "$STAGE/www"
+          cp -f "thermostat-pro-timeline.js" "$STAGE/www/thermostat-pro-timeline.js"
+
+          # 3) Zip alt fra stage-roden
+          (cd "$STAGE" && zip -r "../${{ env.HACS_ZIP }}" . \
+            -x "**/__pycache__/*" "**/*.pyc" ".DS_Store" ".git/*")
 
       - name: Upload ZIP asset to release
         uses: softprops/action-gh-release@v2
