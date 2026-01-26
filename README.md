@@ -11,7 +11,7 @@ Default resource (auto-registered by the integration): `/local/thermostat-pro-ti
 
 ---
 
-## Support this project
+## Support this project ☕
 
 If you find this project useful, you can support me on Ko-fi 💙
 
@@ -19,36 +19,36 @@ If you find this project useful, you can support me on Ko-fi 💙
 
 ---
 
-## At-a-glance features
+## At-a-glance features ✨
 
-- Per-thermostat or merged “room” timelines (control multiple thermostats as one)
-- Color ranges per room or global (`color_ranges` + `color_global`)
-- Weekdays schedules: weekday/weekend, weekday+Sat+Sun, or all 7 days; two views
-- Holidays: dedicated holiday plan (calendar/binary_sensor or manual dates/ranges)
-- Profiles: multiple named profiles per room with activation
-- Away / Presence: auto away when nobody’s home; resume when someone returns
-- Advanced presence: who’s-home combinations + per-room presence sensor with on/off delays
-- Away delay option before applying changes; live presence chips in header
-- Pause: pause indefinitely or until time; optional pause via a `binary_sensor.*`
-- Open Window Detection: suspend heating while windows/doors are open; resume after close (with delays)
-- Boiler control: drive a boiler switch by offsets vs target, or legacy temperature-sensor mode
-- Room-temperature bubble + `temp_sensors` mapping per room
-- Input-number mode per row (drive external automations)
-- Turn-on sequencing for thermostats (send climate.turn_on before/after set_temperature, with delay)
-- Supports both `climate.*` and `input_number.*` targets
-- Custom room labels and thermostat merges
-- Time format (12/24h), time source (browser/HA), and temperature unit auto-detect
-- “Now” indicators (cursor and optional top header line)
-- Shared storage + background control via integration (`storage_enabled: true`)
-- Multiple configurations via instances (namespaces) and instance switching
-- Backup/restore: slots, selective sections, auto backups, and delete backups
-- Color ranges per room or global with persistent storage
-- Localization: English, Danish, Swedish, Norwegian, German, Spanish, French, Finnish, Czech
-- Storage migration tools and clear-data menu (browser/storage)
+- 🧊 Per-thermostat or merged “room” timelines (control multiple thermostats as one)
+- 🎨 Color ranges per room or global (`color_ranges` + `color_global`)
+- 🗓️ Weekdays schedules: weekday/weekend, weekday+Sat+Sun, or all 7 days; two views
+- 🎉 Holidays: dedicated holiday plan (calendar/binary_sensor or manual dates/ranges)
+- 🧾 Profiles: multiple named profiles per room with activation
+- 🏡 Away / Presence: auto away when nobody’s home; resume when someone returns
+- 👥 Advanced presence: who’s-home combinations + per-room presence sensor with on/off delays
+- ⏱️ Away delay option before applying changes; live presence chips in header
+- ⏸️ Pause: pause indefinitely or until time; optional pause via a `binary_sensor.*`
+- 🪟 Open Window Detection: suspend heating while windows/doors are open; resume after close (with delays)
+- 🔥 Boiler control: drive a boiler switch by offsets vs target, or legacy temperature-sensor mode
+- 🌡️ Room-temperature bubble + `temp_sensors` mapping per room
+- 🔢 Input-number mode per row (drive external automations)
+- 🔌 Turn-on sequencing for thermostats (send climate.turn_on before/after set_temperature, with delay)
+- 🔧 Supports both `climate.*` and `input_number.*` targets
+- 🏷️ Custom room labels and thermostat merges
+- 🕒 Time format (12/24h), time source (browser/HA), and temperature unit auto-detect
+- 📍 “Now” indicators (cursor and optional top header line)
+- 💾 Shared storage + background control via integration (`storage_enabled: true`)
+- 🧬 Multiple configurations via instances (namespaces) and instance switching
+- 🧰 Backup/restore: slots, selective sections, auto backups, and delete backups
+- 🎨 Color ranges per room or global with persistent storage
+- 🌍 Localization: English, Danish, Swedish, Norwegian, German, Spanish, French, Finnish, Czech
+- 🧹 Storage migration tools and clear-data menu (browser/storage)
 
 ---
 
-## Storage and integration mode
+## Storage and integration mode 💾
 
 
 The integration (domain `thermostat_timeline`) provides:
@@ -65,7 +65,7 @@ Switching between true/false changes where data lives; timelines/settings won’
 
 ---
 
-## Installation
+## Installation 📦
 
 Recommended: HACS (Integration)
 
@@ -85,7 +85,7 @@ Manual (no HACS)
 
 ---
 
-## Card configuration (YAML)
+## Card configuration (YAML) 🧩
 
 
 Minimum
@@ -119,7 +119,7 @@ apply_on_edit: true
 apply_on_default_change: true
 ```
 
-Labels (optional)
+🏷️ Labels (optional)
 
 ```yaml
 labels:
@@ -127,7 +127,7 @@ labels:
   climate.bedroom: Bedroom
 ```
 
-Merges (control multiple thermostats as one row)
+🔗 Merges (control multiple thermostats as one row)
 
 ```yaml
 merges:
@@ -136,7 +136,7 @@ merges:
     - climate.living_radiator_right
 ```
 
-Turn on (send turn_on in addition to set_temperature)
+🔌 Turn on (send turn_on in addition to set_temperature)
 
 ```yaml
 turn_on:
@@ -145,7 +145,7 @@ turn_on:
     order: before   # 'before' | 'after'
 ```
 
-Room temperature bubble + external sensors
+🌡️ Room temperature bubble + external sensors
 
 ```yaml
 show_room_temp: true
@@ -153,7 +153,7 @@ temp_sensors:
   climate.living_room: sensor.living_temperature
 ```
 
-Input number mode (per row, matches entities[] index)
+🔢 Input number mode (per row, matches entities[] index)
 
 ```yaml
 room_use_input_number:
@@ -161,7 +161,7 @@ room_use_input_number:
   - false
 ```
 
-Pause controls
+⏸️ Pause controls
 
 ```yaml
 show_pause_button: true
@@ -169,7 +169,7 @@ pause_sensor_enabled: true
 pause_sensor_entity: binary_sensor.heating_pause
 ```
 
-Open Window Detection
+🪟 Open Window Detection
 
 
 ```yaml
@@ -183,7 +183,7 @@ open_window:
       - binary_sensor.patio_door
 ```
 
-Weekdays
+🗓️ Weekdays
 
 
 ```yaml
@@ -194,7 +194,7 @@ weekdays_view_switch_in_timeline: false
 weekdays_selected_room: ''
 ```
 
-Away / Presence
+🏡 Away / Presence
 
 ```yaml
 away:
@@ -209,7 +209,7 @@ away:
 presence_live_header: true  # show presence chips
 ```
 
-Holidays
+🎉 Holidays
 
 <!-- IMAGE: Holidays editor – manual dates and date ranges. -->
 <!-- IMAGE: Timeline on an active holiday (holiday badge/notice + holiday blocks). -->
@@ -223,7 +223,7 @@ holidays_dates:
   - '2026-12-25'
 ```
 
-Profiles
+🧾 Profiles
 
 <!-- IMAGE: Profiles dialog – list of profiles, activate/deactivate, rename, delete. -->
 <!-- IMAGE: Editing blocks within a profile + Active profile label. -->
@@ -232,7 +232,7 @@ Profiles
 profiles_enabled: true
 ```
 
-Boiler control
+🔥 Boiler control
 
 <!-- IMAGE: Boiler control editor – switch entity, offsets (on/off), room selection. -->
 <!-- IMAGE: Boiler status chip/indicator while heating demand is ON. -->
@@ -256,7 +256,7 @@ boiler_min_temp: 20
 boiler_max_temp: 25
 ```
 
-Color ranges
+🎨 Color ranges
 
 <!-- IMAGE: Color ranges editor – per-room intervals. -->
 <!-- IMAGE: Color ranges editor – global mode with single set applied to all rooms. -->
@@ -284,7 +284,7 @@ color_ranges:
     - { from: 21, to: 25, color: "#ffb347" }
 ```
 
-Instances (namespaced configurations)
+🧬 Instances (namespaced configurations)
 
 <!-- IMAGE: Configuration ID field in editor + example of switching instances (winter/summer). -->
 
@@ -293,7 +293,7 @@ instance_enabled: true
 instance_id: winter
 ```
 
-Backups (auto)
+🧰 Backups (auto)
 
 <!-- IMAGE: Backup tab – “New backup”, slot selector, last backup timestamp. -->
 <!-- IMAGE: Restore dialog – select sections (main, weekday, presence, settings, holiday, colors, profiles), merge vs replace. -->
@@ -304,7 +304,7 @@ backup_auto_enabled: true
 backup_interval_days: 1
 ```
 
-Storage
+🗄️ Storage
 
 <!-- IMAGE: Integration connection status (Connected/Not connected). -->
 <!-- IMAGE: Storage migration dialog (browser → storage and storage → browser). -->
@@ -317,11 +317,11 @@ storage_entity: sensor.thermostat_timeline
 
 ---
 
-## Integration services (YAML examples)
+## Integration services (YAML examples) 🛠️
 
 Domain: `thermostat_timeline`
 
-- set_store — replace the store (schedules/settings) and bump version
+- 🗃️ set_store — replace the store (schedules/settings) and bump version
 
 ```yaml
 service: thermostat_timeline.set_store
@@ -339,7 +339,7 @@ data:
     auto_apply_enabled: true
 ```
 
-- select_instance — switch active instance (for background control and API)
+- 🧭 select_instance — switch active instance (for background control and API)
 
 ```yaml
 service: thermostat_timeline.select_instance
@@ -349,7 +349,7 @@ data:
   copy_from_active: true
 ```
 
-- rename_instance — rename an instance id
+- ✏️ rename_instance — rename an instance id
 
 ```yaml
 service: thermostat_timeline.rename_instance
@@ -358,7 +358,7 @@ data:
   new_instance_id: winter_2026
 ```
 
-- patch_entity — merge data into a single climate entity
+- 🩹 patch_entity — merge data into a single climate entity
 
 ```yaml
 service: thermostat_timeline.patch_entity
@@ -370,19 +370,19 @@ data:
       - { from: "17:00", to: "22:00", temp: 22 }
 ```
 
-- clear — clear all schedules and bump version
+- 🧹 clear — clear all schedules and bump version
 
 ```yaml
 service: thermostat_timeline.clear
 ```
 
-- factory_reset — delete storage files and recreate them empty
+- 🧨 factory_reset — delete storage files and recreate them empty
 
 ```yaml
 service: thermostat_timeline.factory_reset
 ```
 
-- backup_now — create a backup (select sections)
+- 💾 backup_now — create a backup (select sections)
 
 ```yaml
 service: thermostat_timeline.backup_now
@@ -395,7 +395,7 @@ data:
   colors: true
 ```
 
-- restore_now — restore from backup (merge or replace)
+- ♻️ restore_now — restore from backup (merge or replace)
 
 ```yaml
 service: thermostat_timeline.restore_now
@@ -409,7 +409,7 @@ data:
   colors: true
 ```
 
-- delete_backup — delete one backup slot or all when no slot given
+- 🗑️ delete_backup — delete one backup slot or all when no slot given
 
 ```yaml
 service: thermostat_timeline.delete_backup
@@ -419,7 +419,7 @@ data:
 
 ---
 
-## Troubleshooting
+## Troubleshooting 🧯
 
 <!-- IMAGE: Resources list showing duplicate entries (highlight duplicates to remove). -->
 
@@ -441,7 +441,7 @@ Expected: `storage_enabled: false` uses browser LocalStorage; `true` uses the in
 
 ---
 
-## Localization
+## Localization 🌍
 
 <!-- IMAGE: Card UI shown in two languages side-by-side (e.g., English and Danish) to demonstrate localization. -->
 
@@ -451,7 +451,7 @@ Defaults to English when a translation is missing.
 
 ---
 
-## Advanced
+## Advanced ⚙️
 
 API endpoints (require auth):
 
@@ -462,7 +462,7 @@ These return the current schedules/settings snapshot and version info.
 
 ---
 
-## Advanced settings (card → Settings tab)
+## Advanced settings (card → Settings tab) 🧪
 
 <!-- IMAGE: Advanced settings controls – range_band_c slider/input and turn_on_delay_s input in the editor. -->
 
@@ -484,7 +484,7 @@ Notes
 
 ---
 
-## Example: full card config
+## Example: full card config 📘
 
 <!-- IMAGE: Final dashboard card in use with colors, weekdays, presence chips, OWD icon, and boiler chip visible. -->
 
