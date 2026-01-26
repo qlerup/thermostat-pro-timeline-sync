@@ -9,8 +9,6 @@ Default resource (auto-registered by the integration): `/local/thermostat-pro-ti
 
 <img width="2288" height="476" alt="image" src="https://github.com/user-attachments/assets/95a17e9d-e404-4bad-ba93-5af0a6cff6d5" />
 
-<!-- IMAGE: Hero overview — desktop timeline with multiple rooms, colored blocks, now-line, presence chips, and boiler status chip if enabled. Also add a second shot of tablet/mobile layout. -->
-
 ---
 
 ## Support this project
@@ -22,8 +20,6 @@ If you find this project useful, you can support me on Ko-fi 💙
 ---
 
 ## At-a-glance features
-
-<!-- IMAGE: Feature collage — small callouts for merges, color ranges, weekdays, holidays, profiles, presence, OWD, boiler, backups, instances. -->
 
 - Per-thermostat or merged “room” timelines (control multiple thermostats as one)
 - Color ranges per room or global (`color_ranges` + `color_global`)
@@ -54,9 +50,6 @@ If you find this project useful, you can support me on Ko-fi 💙
 
 ## Storage and integration mode
 
-<!-- IMAGE: Connected to integration indicator in editor (on/off). -->
-<!-- IMAGE: Storage migration dialog (browser → storage and storage → browser). -->
-<!-- IMAGE: Clear data menu – All data, Local only, Storage only, Clear colors. -->
 
 The integration (domain `thermostat_timeline`) provides:
 
@@ -73,9 +66,6 @@ Switching between true/false changes where data lives; timelines/settings won’
 ---
 
 ## Installation
-
-<!-- IMAGE: HACS – Integration install screen for Thermostat Timeline. -->
-<!-- IMAGE: Settings → Dashboards → Resources – resource entry /local/thermostat-pro-timeline.js. -->
 
 Recommended: HACS (Integration)
 
@@ -97,7 +87,6 @@ Manual (no HACS)
 
 ## Card configuration (YAML)
 
-<!-- IMAGE: Card editor – Settings tab with title, rows, default temp, min/max, time format and unit. -->
 
 Minimum
 
@@ -107,9 +96,6 @@ entities:
   - climate.living_room
   - climate.bedroom
 ```
-
-<!-- IMAGE: Block editor modal – Add/Edit/Delete block, overlap auto-fix suggestions. -->
-<!-- IMAGE: Copy/Paste plan and Copy/Paste day actions in the editor toolbar. -->
 
 Global options (commonly used)
 
@@ -135,8 +121,6 @@ apply_on_default_change: true
 
 Labels (optional)
 
-<!-- IMAGE: Labels mapping UI – per-room custom display names in editor. -->
-
 ```yaml
 labels:
   climate.living_room: Living Room
@@ -144,9 +128,6 @@ labels:
 ```
 
 Merges (control multiple thermostats as one row)
-
-<!-- IMAGE: Merges editor – selecting secondary thermostats to merge into a primary. -->
-<!-- IMAGE: Timeline row showing merged thermostats (single row controlling multiple entities). -->
 
 ```yaml
 merges:
@@ -157,8 +138,6 @@ merges:
 
 Turn on (send turn_on in addition to set_temperature)
 
-<!-- IMAGE: Turn-on sequencing setting in editor (before/after + short description). -->
-
 ```yaml
 turn_on:
   climate.living_room:
@@ -168,9 +147,6 @@ turn_on:
 
 Room temperature bubble + external sensors
 
-<!-- IMAGE: Timeline header with room temperature bubble visible. -->
-<!-- IMAGE: Temp sensor mapping UI (select sensor for room temperature). -->
-
 ```yaml
 show_room_temp: true
 temp_sensors:
@@ -178,8 +154,6 @@ temp_sensors:
 ```
 
 Input number mode (per row, matches entities[] index)
-
-<!-- IMAGE: Timeline row driven by input_number.* (no HVAC icons, just target value applied). -->
 
 ```yaml
 room_use_input_number:
@@ -189,9 +163,6 @@ room_use_input_number:
 
 Pause controls
 
-<!-- IMAGE: Pause menu (Paused until…) and indicator chip in header. -->
-<!-- IMAGE: Pause via binary_sensor ON – card shows paused state. -->
-
 ```yaml
 show_pause_button: true
 pause_sensor_enabled: true
@@ -200,8 +171,6 @@ pause_sensor_entity: binary_sensor.heating_pause
 
 Open Window Detection
 
-<!-- IMAGE: Room suspended due to open window/door (row dimmed or icon), with resume after close. -->
-<!-- IMAGE: OWD settings – sensors list and open/close delays. -->
 
 ```yaml
 open_window:
@@ -216,9 +185,6 @@ open_window:
 
 Weekdays
 
-<!-- IMAGE: Weekdays editor – “All rooms • one day” view. -->
-<!-- IMAGE: Weekdays editor – “All days • one room” view. -->
-<!-- IMAGE: View switch toggle in timeline header. -->
 
 ```yaml
 weekdays_enabled: true
@@ -229,11 +195,6 @@ weekdays_selected_room: ''
 ```
 
 Away / Presence
-
-<!-- IMAGE: Presence chips in header (who is home/away). -->
-<!-- IMAGE: Advanced presence editor – combinations matrix and per-combo schedules. -->
-<!-- IMAGE: Per-room presence override (sensor entity, on/off delays, on-temp). -->
-<!-- IMAGE: Away delay configuration (seconds/minutes). -->
 
 ```yaml
 away:
